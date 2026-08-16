@@ -11,17 +11,18 @@ import (
 
 // Logger is a minimal structured JSON logger.
 type Logger struct {
-	mu   sync.Mutex
-	out  io.Writer
-	log  *log.Logger
+	mu  sync.Mutex
+	log *log.Logger
 }
 
 // NewLogger creates a JSON logger writing to stderr by default.
 func NewLogger() *Logger {
-	return &Logger{
-		out: os.Stderr,
-		log: log.New(os.Stderr, "", 0),
-	}
+	return NewLoggerTo(os.Stderr)
+}
+
+// NewLoggerTo creates a JSON logger writing to the given writer.
+func NewLoggerTo(w io.Writer) *Logger {
+	return &Logger{log: log.New(w, "", 0)}
 }
 
 func (l *Logger) logf(level, msg string, fields map[string]any) {

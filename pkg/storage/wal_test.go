@@ -72,6 +72,7 @@ func TestDiskStoreCrashRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	s.Put("a", "1")
 	// Simulate a crash: no Close. Acked writes must survive a reopen.
 	s2, err := OpenDiskStore(dir)

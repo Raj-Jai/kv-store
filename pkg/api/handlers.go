@@ -13,8 +13,9 @@ import (
 
 // Server holds the storage engine and routes requests to it.
 type Server struct {
-	engine storage.Engine
-	logger *util.Logger
+	engine  storage.Engine
+	logger  *util.Logger
+	metrics *Metrics
 }
 
 // NewServer creates an API server backed by the given storage engine.
@@ -22,7 +23,7 @@ func NewServer(engine storage.Engine, logger *util.Logger) *Server {
 	if logger == nil {
 		logger = util.NewLogger()
 	}
-	return &Server{engine: engine, logger: logger}
+	return &Server{engine: engine, logger: logger, metrics: NewMetrics()}
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -65,6 +66,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, err := s.engine.Get(key); errors.Is(err, storage.ErrNotFound) {
+		s.metrics.IncrKeys()
+	}
 	if err := s.engine.Put(key, string(body)); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -75,6 +79,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	if _, err := s.engine.Get(key); err == nil {
+		s.metrics.DecrKeys()
+	}
 	if err := s.engine.Delete(key); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

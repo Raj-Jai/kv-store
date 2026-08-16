@@ -53,10 +53,15 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w}
 		next.ServeHTTP(rw, r)
+		status := rw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		s.metrics.Record(status, time.Since(start))
 		s.logger.Info("request", map[string]any{
 			"method":   r.Method,
 			"path":     r.URL.Path,
-			"status":   rw.status,
+			"status":   status,
 			"duration": time.Since(start).String(),
 		})
 	})

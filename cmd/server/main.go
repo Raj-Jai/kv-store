@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Raj-Jai/kv-store/pkg/api"
 	"github.com/Raj-Jai/kv-store/pkg/storage"
@@ -32,7 +36,6 @@ func main() {
 
 	// Temporary backend while the persistent disk engine is under development.
 	store := storage.NewMemStore()
-	defer store.Close()
 
 	logger := util.NewLogger()
 	server := api.NewServer(store, logger)
@@ -45,8 +48,34 @@ func main() {
 	logger.Info("kv-store starting", map[string]any{"port": port, "data_dir": dataDir})
 	logger.Info("using in-memory storage engine (persistent engine pending)", nil)
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server failed", map[string]any{"error": err.Error()})
-		log.Fatal(err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("server failed", map[string]any{"error": err.Error()})
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		logger.Info("shutdown signal received", nil)
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("graceful shutdown failed", map[string]any{"error": err.Error()})
+	}
+
+	logger.Info("closing storage engine", nil)
+	if err := store.Close(); err != nil {
+		logger.Error("engine close failed", map[string]any{"error": err.Error()})
+	}
+
+	logger.Info("server stopped", nil)
 }
