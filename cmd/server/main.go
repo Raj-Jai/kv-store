@@ -2,9 +2,12 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 
+	"github.com/Raj-Jai/kv-store/pkg/api"
 	"github.com/Raj-Jai/kv-store/pkg/storage"
+	"github.com/Raj-Jai/kv-store/pkg/util"
 )
 
 const (
@@ -31,6 +34,19 @@ func main() {
 	store := storage.NewMemStore()
 	defer store.Close()
 
-	log.Printf("kv-store starting on port %s with data dir %s", port, dataDir)
-	log.Printf("using in-memory storage engine (persistent engine pending)")
+	logger := util.NewLogger()
+	server := api.NewServer(store, logger)
+
+	httpServer := &http.Server{
+		Addr:    ":" + port,
+		Handler: server.Handler(),
+	}
+
+	logger.Info("kv-store starting", map[string]any{"port": port, "data_dir": dataDir})
+	logger.Info("using in-memory storage engine (persistent engine pending)", nil)
+
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Error("server failed", map[string]any{"error": err.Error()})
+		log.Fatal(err)
+	}
 }
