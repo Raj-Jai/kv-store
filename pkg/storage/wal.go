@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // opCode identifies the type of a WAL record.
@@ -19,8 +20,8 @@ const (
 )
 
 // WAL is an append-only log of mutations in the format
-// [opCode][keyLen][key][valLen][value]. An operation is durable once
-// Sync returns; Replay restores the logged state into memory.
+// [opCode][keyLen][key][valLen][value]. An operation is durable once Sync
+// returns; Replay restores the logged state into memory.
 type WAL struct {
 	path string
 	f    *os.File
@@ -70,6 +71,11 @@ func (w *WAL) Sync() error {
 // Close closes the underlying file.
 func (w *WAL) Close() error {
 	return w.f.Close()
+}
+
+// Truncate empties the log file. Callers must ensure no append is in flight.
+func (w *WAL) Truncate() error {
+	return os.Truncate(w.path, 0)
 }
 
 // Replay reads every record in order and applies it to m, restoring the
@@ -128,16 +134,28 @@ func readString(r *bufio.Reader) (string, error) {
 	return string(buf), nil
 }
 
-// DiskStore is a durable Engine: every mutation is appended to the WAL and
-// synced before it is applied to memory, so an acknowledged write survives a
-// crash. Recovery replays the WAL into memory on startup.
+// DiskStore is a durable Engine: mutations are queued, appended to the WAL,
+// and synced with a single fsync per batch before being applied to memory, so
+// an acknowledged write survives a crash. Recovery loads the latest snapshot
+// and replays any WAL entries written after it.
 type DiskStore struct {
 	mem *MemStore
 	wal *WAL
+
+	batchChan chan *batchRequest
+	batchDone chan struct{}
+	snapMu    sync.Mutex // serializes WAL append/apply against snapshot+truncate
+
+	snapshotPath string
+	walPath      string
+
+	stopSnap  chan struct{}
+	snapDone  chan struct{}
+	closeOnce sync.Once
 }
 
 // OpenDiskStore creates a persistent store in dataDir, restoring any
-// previously acknowledged state by replaying the WAL.
+// previously acknowledged state by loading the snapshot and replaying the WAL.
 func OpenDiskStore(dataDir string) (*DiskStore, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -148,11 +166,29 @@ func OpenDiskStore(dataDir string) (*DiskStore, error) {
 		return nil, err
 	}
 
-	s := &DiskStore{mem: NewMemStore(), wal: wal}
+	s := &DiskStore{
+		mem:          NewMemStore(),
+		wal:          wal,
+		walPath:      filepath.Join(dataDir, "wal.log"),
+		snapshotPath: filepath.Join(dataDir, "snapshot.dat"),
+		batchChan:    make(chan *batchRequest, 2*maxBatchSize),
+		batchDone:    make(chan struct{}),
+		stopSnap:     make(chan struct{}),
+		snapDone:     make(chan struct{}),
+	}
+
+	if err := s.loadSnapshot(); err != nil {
+		wal.Close()
+		return nil, err
+	}
 	if err := s.wal.Replay(s.mem); err != nil {
 		wal.Close()
 		return nil, err
 	}
+
+	go s.batchLoop()
+	go s.snapshotLoop()
+
 	return s, nil
 }
 
@@ -161,39 +197,41 @@ func (s *DiskStore) Get(key string) (string, error) {
 }
 
 func (s *DiskStore) Put(key, value string) error {
-	if err := s.wal.AppendPut(key, value); err != nil {
-		return err
-	}
-	if err := s.wal.Sync(); err != nil {
-		return err
-	}
-	return s.mem.Put(key, value)
+	return s.submit(&batchRequest{op: opPut, key: key, value: value})
 }
 
 func (s *DiskStore) Delete(key string) error {
-	if err := s.wal.AppendDelete(key); err != nil {
-		return err
-	}
-	if err := s.wal.Sync(); err != nil {
-		return err
-	}
-	return s.mem.Delete(key)
+	return s.submit(&batchRequest{op: opDelete, key: key})
 }
 
 func (s *DiskStore) Clear() error {
-	if err := s.wal.AppendClear(); err != nil {
-		return err
-	}
-	if err := s.wal.Sync(); err != nil {
-		return err
-	}
-	return s.mem.Clear()
+	return s.submit(&batchRequest{op: opClear})
 }
 
-// Close flushes pending writes and closes the WAL.
+// submit queues a mutation and blocks until it is durable.
+func (s *DiskStore) submit(req *batchRequest) error {
+	req.errChan = make(chan error, 1)
+	s.batchChan <- req
+	return <-req.errChan
+}
+
+// Close drains pending writes, saves a snapshot, truncates the WAL, and
+// closes the log file.
 func (s *DiskStore) Close() error {
-	if err := s.wal.Sync(); err != nil {
-		return err
-	}
-	return s.wal.Close()
+	var closeErr error
+	s.closeOnce.Do(func() {
+		close(s.stopSnap)
+		<-s.snapDone
+
+		close(s.batchChan)
+		<-s.batchDone
+
+		if err := s.compact(); err != nil {
+			closeErr = err
+		}
+		if err := s.wal.Close(); err != nil {
+			closeErr = err
+		}
+	})
+	return closeErr
 }
