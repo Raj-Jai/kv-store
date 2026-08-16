@@ -5,3 +5,5 @@
 data/
 cmd/server/server
 request_test/*
+mydata
+kv-store
