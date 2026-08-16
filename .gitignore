@@ -3,3 +3,5 @@
 
 # Runtime data
 data/
+cmd/server/server
+request_test/*

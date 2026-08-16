@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	defaultPort     = "8080"
-	defaultDataDir  = "./data"
+	defaultPort    = "8081"
+	defaultDataDir = "./data"
 )
 
 func envOr(key, fallback string) string {
