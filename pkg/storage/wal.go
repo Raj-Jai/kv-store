@@ -152,6 +152,8 @@ type DiskStore struct {
 	stopSnap  chan struct{}
 	snapDone  chan struct{}
 	closeOnce sync.Once
+	closeMu   sync.RWMutex // guards the closed flag and batchChan shutdown
+	closed    bool
 }
 
 // OpenDiskStore creates a persistent store in dataDir, restoring any
@@ -208,22 +210,33 @@ func (s *DiskStore) Clear() error {
 	return s.submit(&batchRequest{op: opClear})
 }
 
-// submit queues a mutation and blocks until it is durable.
+// submit queues a mutation and blocks until it is durable. Writes issued after
+// the store is closed return ErrClosed.
 func (s *DiskStore) submit(req *batchRequest) error {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
 	req.errChan = make(chan error, 1)
 	s.batchChan <- req
 	return <-req.errChan
 }
 
 // Close drains pending writes, saves a snapshot, truncates the WAL, and
-// closes the log file.
+// closes the log file. In-flight writes finish and stay durable; new writes
+// fail with ErrClosed.
 func (s *DiskStore) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
 		close(s.stopSnap)
 		<-s.snapDone
 
+		s.closeMu.Lock()
+		s.closed = true
 		close(s.batchChan)
+		s.closeMu.Unlock()
+
 		<-s.batchDone
 
 		if err := s.compact(); err != nil {

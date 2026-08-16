@@ -14,3 +14,6 @@ type Engine interface {
 
 // ErrNotFound is returned by Get when the key does not exist.
 var ErrNotFound = errors.New("key not found")
+
+// ErrClosed is returned by write operations after the store is closed.
+var ErrClosed = errors.New("store closed")

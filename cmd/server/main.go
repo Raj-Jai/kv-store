@@ -30,12 +30,10 @@ func main() {
 	port := envOr("PORT", defaultPort)
 	dataDir := envOr("DATA_DIR", defaultDataDir)
 
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		log.Fatalf("failed to create data directory %q: %v", dataDir, err)
+	store, err := storage.OpenDiskStore(dataDir)
+	if err != nil {
+		log.Fatalf("failed to open storage engine: %v", err)
 	}
-
-	// Temporary backend while the persistent disk engine is under development.
-	store := storage.NewMemStore()
 
 	logger := util.NewLogger()
 	server := api.NewServer(store, logger)
@@ -46,7 +44,6 @@ func main() {
 	}
 
 	logger.Info("kv-store starting", map[string]any{"port": port, "data_dir": dataDir})
-	logger.Info("using in-memory storage engine (persistent engine pending)", nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
