@@ -17,3 +17,32 @@ var ErrNotFound = errors.New("key not found")
 
 // ErrClosed is returned by write operations after the store is closed.
 var ErrClosed = errors.New("store closed")
+
+// Op identifies a storage mutation.
+type Op uint8
+
+const (
+	OpPut Op = iota + 1
+	OpDelete
+	OpClear
+)
+
+// Command is a serializable storage mutation carried by the consensus log.
+type Command struct {
+	Op    Op
+	Key   string
+	Value string
+}
+
+// NotLeaderError is returned by write operations on a non-leader node. It
+// carries the current leader's address when one is known.
+type NotLeaderError struct {
+	LeaderAddr string
+}
+
+func (e *NotLeaderError) Error() string {
+	if e.LeaderAddr == "" {
+		return "no leader known"
+	}
+	return "not the leader; leader is " + e.LeaderAddr
+}
