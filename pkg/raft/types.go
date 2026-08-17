@@ -82,6 +82,10 @@ type Node struct {
 
 	lastQuorumAck time.Time
 
+	// repl is Developer A's leader-side replication state (M1.3). The type is
+	// defined in leader.go so the contract file stays minimal.
+	repl *replicationState
+
 	transport Transport
 	store     storage.Engine
 

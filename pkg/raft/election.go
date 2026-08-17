@@ -123,14 +123,17 @@ func (n *Node) startElection() {
 	n.mu.Unlock()
 }
 
-// sendHeartbeats broadcasts an empty AppendEntries to every peer to hold the
-// term and suppress competing elections, and records the last time a majority
-// acknowledged the leader.
+// sendHeartbeats broadcasts an AppendEntries (carrying any pending log
+// entries) to every peer to hold the term, replicate, and record the last
+// time a majority acknowledged the leader.
 func (n *Node) sendHeartbeats() {
 	n.mu.Lock()
-	req := AppendEntriesRequest{Term: n.term, LeaderID: n.id}
-	quorum := majority(n.peers)
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return
+	}
 	peers := append([]string(nil), n.peers...)
+	quorum := majority(n.peers)
 	n.mu.Unlock()
 
 	var (
@@ -142,18 +145,7 @@ func (n *Node) sendHeartbeats() {
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
-			resp, err := n.transport.AppendEntries(peer, req)
-			if err != nil {
-				return
-			}
-			n.mu.Lock()
-			if resp.Term > n.term {
-				n.becomeFollower(resp.Term, nil)
-				n.mu.Unlock()
-				return
-			}
-			n.mu.Unlock()
-			if resp.Success {
+			if n.replicateToPeer(peer) {
 				mu.Lock()
 				acks++
 				mu.Unlock()

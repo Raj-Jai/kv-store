@@ -6,9 +6,41 @@ import (
 	"github.com/Raj-Jai/kv-store/pkg/storage"
 )
 
-// Engine implementation — Developer A (M1.2). raft.Node wraps a
-// storage.Engine and proposes mutations through consensus, so Developer B's
-// HTTP handlers keep talking to an Engine unchanged.
+// Engine implementation and leader-side replication — Developer A
+// (M1.2/M1.3). raft.Node wraps a storage.Engine and proposes mutations
+// through consensus, so Developer B's HTTP handlers keep talking to an
+// Engine unchanged.
+
+// maxReplBackoff caps the exponential rewind step used when a follower keeps
+// rejecting a log prefix.
+const maxReplBackoff = 64
+
+// replicationState is the per-follower leader bookkeeping (M1.3). It lives
+// off the shared Node struct so the contract file stays minimal.
+type replicationState struct {
+	nextIndex  map[string]int // next log index to send to each peer
+	matchIndex map[string]int // highest log index known replicated to each peer
+	inFlight   map[string]bool
+	backoff    map[string]int // exponential rewind step on repeated rejection
+}
+
+// replState lazily initializes the leader replication state. Callers must
+// hold n.mu.
+func (n *Node) replState() *replicationState {
+	if n.repl == nil {
+		n.repl = &replicationState{
+			nextIndex:  make(map[string]int),
+			matchIndex: make(map[string]int),
+			inFlight:   make(map[string]bool),
+			backoff:    make(map[string]int),
+		}
+		next := n.lastLogIndex() + 1
+		for _, p := range n.peers {
+			n.repl.nextIndex[p] = next
+		}
+	}
+	return n.repl
+}
 
 // Leader returns the current leader's address, or "" when none is known.
 func (n *Node) Leader() string {
@@ -49,11 +81,12 @@ func (n *Node) Close() error {
 	return n.store.Close()
 }
 
-// propose appends a command to the leader's log. It returns
-// storage.NotLeaderError{LeaderAddr} when this node is not the leader. For a
-// single-node cluster the entry is committed and applied immediately; for a
-// multi-node cluster the leader returns once the entry is on its own log —
-// replication, commit, and synchronous return-to-client land in M1.3/M1.4.
+// propose appends a command to the leader's log and kicks replication to
+// every peer in the background. It returns storage.NotLeaderError{LeaderAddr}
+// when this node is not the leader. For a single-node cluster the entry is
+// committed and applied immediately; for a multi-node cluster the leader
+// returns once the entry is on its own log — commit-index advancement and the
+// synchronous return-to-client land in M1.4.
 func (n *Node) propose(cmd storage.Command) error {
 	n.mu.Lock()
 	if n.role != RoleLeader {
@@ -69,12 +102,113 @@ func (n *Node) propose(cmd storage.Command) error {
 	if singleNode {
 		n.commitIndex = len(n.log)
 	}
-	n.mu.Unlock()
-
 	if singleNode {
+		n.mu.Unlock()
 		return n.applyCmd(cmd)
 	}
+	peers := append([]string(nil), n.peers...)
+	n.mu.Unlock()
+
+	for _, peer := range peers {
+		go n.replicateToPeer(peer)
+	}
 	return nil
+}
+
+// replicateToPeer sends any pending log entries (batched) to one follower as
+// an AppendEntries and drives the follower to catch up: it advances
+// nextIndex/matchIndex on success, rewinds with exponential backoff and
+// retries immediately on rejection, and steps the leader down on a higher
+// term. It returns whether the peer is acknowledged at the current term.
+func (n *Node) replicateToPeer(peer string) bool {
+	for {
+		n.mu.Lock()
+		if n.role != RoleLeader {
+			n.mu.Unlock()
+			return false
+		}
+		st := n.replState()
+		if st.inFlight[peer] {
+			// Another goroutine is already driving this peer to catch up.
+			n.mu.Unlock()
+			return false
+		}
+		next := st.nextIndex[peer]
+		if next < 1 {
+			next = 1
+		}
+		prevLogIndex := next - 1
+		prevLogTerm := 0
+		if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
+			prevLogTerm = n.log[prevLogIndex-1].Term
+		}
+		var entries []Entry
+		if next <= len(n.log) {
+			entries = append([]Entry(nil), n.log[next-1:]...)
+		}
+		req := AppendEntriesRequest{
+			Term:         n.term,
+			LeaderID:     n.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: n.commitIndex,
+		}
+		st.inFlight[peer] = true
+		n.mu.Unlock()
+
+		resp, err := n.transport.AppendEntries(peer, req)
+		if err != nil {
+			n.mu.Lock()
+			st.inFlight[peer] = false
+			n.mu.Unlock()
+			return false
+		}
+
+		n.mu.Lock()
+		st.inFlight[peer] = false
+
+		if resp.Term > n.term {
+			n.becomeFollower(resp.Term, nil)
+			n.mu.Unlock()
+			return false
+		}
+		if resp.Term < n.term {
+			n.mu.Unlock()
+			return false
+		}
+		if !resp.Success {
+			step := st.backoff[peer]
+			if step == 0 {
+				step = 1
+			}
+			if st.nextIndex[peer] > step {
+				st.nextIndex[peer] -= step
+			} else {
+				st.nextIndex[peer] = 1
+			}
+			if step < maxReplBackoff {
+				st.backoff[peer] = step * 2
+			}
+			gaveUp := step >= maxReplBackoff
+			n.mu.Unlock()
+			if gaveUp {
+				return false // retried on the next heartbeat tick
+			}
+			continue // re-send immediately at the rewound index
+		}
+
+		st.backoff[peer] = 0
+		matched := prevLogIndex + len(entries)
+		if matched > st.matchIndex[peer] {
+			st.matchIndex[peer] = matched
+		}
+		if matched+1 > st.nextIndex[peer] {
+			st.nextIndex[peer] = matched + 1
+		}
+		n.mu.Unlock()
+		return true
+	}
 }
 
 // applyCmd executes a single command against the local state machine. The
