@@ -1,15 +1,19 @@
 package raft
 
-// Inbound RPC handlers — Developer B (M1.1/M1.3). These run on every node
-// and implement the receiving side of the contract: vote-granting, term
-// step-down, follower log matching and truncation, and commit-index advance
-// from the leader.
+import "log"
+
+// Inbound RPC handlers — Developer B (M1.1/M1.3), with durability hooks from
+// Developer A (M1.5). These run on every node and implement the receiving
+// side of the contract: vote-granting, term step-down, follower log matching
+// and truncation, commit-index advance from the leader, and snapshot
+// installation.
 
 // RaftHandler is the inbound side of the Transport seam. A node's handlers
 // are registered with an in-memory or HTTP transport so peers can reach it.
 type RaftHandler interface {
 	HandleRequestVote(req VoteRequest) VoteResponse
 	HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse
+	HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshotResponse
 }
 
 // resetElectionTimer resets the election timer on a valid leader heartbeat or
@@ -29,14 +33,16 @@ func (n *Node) resetElectionTimer() {
 //   - the vote is granted only when this node has not already voted in the
 //     term and the candidate's log is at least as fresh as our own.
 //
-// Granting a vote resets the election timer so a likely leader is not
-// disrupted by a premature election on this node.
+// A granted vote is persisted before the response is returned, so a crash
+// between the decision and the response cannot produce a second vote in the
+// same term. Granting a vote also resets the election timer so a likely
+// leader is not disrupted by a premature election on this node.
 func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	if req.Term < n.term {
-		return VoteResponse{Term: n.term, VoteGranted: false}
+		resp := VoteResponse{Term: n.term, VoteGranted: false}
+		n.mu.Unlock()
+		return resp
 	}
 	if req.Term > n.term {
 		n.becomeFollower(req.Term, nil)
@@ -48,10 +54,18 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 
 	if notVotedYet && logFresh {
 		n.votedFor = &req.CandidateID
+		n.dirty = true
 		n.resetElectionTimer()
-		return VoteResponse{Term: n.term, VoteGranted: true}
+		resp := VoteResponse{Term: n.term, VoteGranted: true}
+		n.mu.Unlock()
+		if err := n.persist(); err != nil {
+			log.Printf("raft: persist vote failed: %v", err)
+		}
+		return resp
 	}
-	return VoteResponse{Term: n.term, VoteGranted: false}
+	resp := VoteResponse{Term: n.term, VoteGranted: false}
+	n.mu.Unlock()
+	return resp
 }
 
 // HandleAppendEntries implements the receiving side of AppendEntries:
@@ -62,12 +76,14 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 //     request is rejected so the leader can rewind;
 //   - on match we truncate any divergent or stale suffix and append the
 //     leader's entries, then advance commitIndex up to leaderCommit.
+//
+// Any log change is persisted before the success response is returned.
 func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	if req.Term < n.term {
-		return AppendEntriesResponse{Term: n.term, Success: false}
+		resp := AppendEntriesResponse{Term: n.term, Success: false}
+		n.mu.Unlock()
+		return resp
 	}
 
 	leader := req.LeaderID
@@ -79,18 +95,27 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	n.resetElectionTimer()
 
 	if !n.checkPrevLog(req.PrevLogIndex, req.PrevLogTerm) {
-		return AppendEntriesResponse{Term: n.term, Success: false}
+		resp := AppendEntriesResponse{Term: n.term, Success: false}
+		n.mu.Unlock()
+		return resp
 	}
 
-	n.mergeEntries(req)
-
+	if n.mergeEntries(req) {
+		n.dirty = true
+	}
 	if req.LeaderCommit > n.commitIndex {
-		if req.LeaderCommit < len(n.log) {
+		if last := n.lastLogIndex(); req.LeaderCommit < last {
 			n.commitIndex = req.LeaderCommit
 		} else {
-			n.commitIndex = len(n.log)
+			n.commitIndex = last
 		}
+		n.dirty = true
 	}
 
-	return AppendEntriesResponse{Term: n.term, Success: true}
+	resp := AppendEntriesResponse{Term: n.term, Success: true}
+	n.mu.Unlock()
+	if err := n.persist(); err != nil {
+		log.Printf("raft: persist log append failed: %v", err)
+	}
+	return resp
 }

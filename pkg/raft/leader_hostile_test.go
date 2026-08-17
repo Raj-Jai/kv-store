@@ -69,6 +69,10 @@ func (t *hostileTransport) AppendEntries(_ string, req AppendEntriesRequest) (Ap
 	return t.follower.handle(req), nil
 }
 
+func (t *hostileTransport) InstallSnapshot(_ string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{Term: req.Term, Success: false}, nil
+}
+
 func runHostileConvergence(t *testing.T, f *hostileFollower, want int) {
 	t.Helper()
 	trans := &hostileTransport{follower: f}

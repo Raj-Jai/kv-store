@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"log"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -78,6 +79,12 @@ func (n *Node) startElection() {
 	peers := append([]string(nil), n.peers...)
 	n.mu.Unlock()
 
+	// The new term and self-vote must be durable before any peer hears the
+	// RequestVote, otherwise a crash mid-election could vote twice.
+	if err := n.persist(); err != nil {
+		log.Printf("raft: persist election state failed: %v", err)
+	}
+
 	results := make(chan VoteResponse, len(peers))
 	var wg sync.WaitGroup
 	for _, peer := range peers {
@@ -102,6 +109,7 @@ func (n *Node) startElection() {
 		if resp.Term > n.term {
 			n.becomeFollower(resp.Term, nil)
 			n.mu.Unlock()
+			n.persist()
 			return
 		}
 		n.mu.Unlock()

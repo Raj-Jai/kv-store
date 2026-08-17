@@ -9,6 +9,7 @@ package raft
 type Transport interface {
 	RequestVote(peer string, req VoteRequest) (VoteResponse, error)
 	AppendEntries(peer string, req AppendEntriesRequest) (AppendEntriesResponse, error)
+	InstallSnapshot(peer string, req InstallSnapshotRequest) (InstallSnapshotResponse, error)
 }
 
 // FakeTransport is the contract fake: every call succeeds with a benign
@@ -22,4 +23,8 @@ func (FakeTransport) RequestVote(peer string, req VoteRequest) (VoteResponse, er
 
 func (FakeTransport) AppendEntries(peer string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
 	return AppendEntriesResponse{Term: req.Term, Success: true}, nil
+}
+
+func (FakeTransport) InstallSnapshot(peer string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{Term: req.Term, Success: true}, nil
 }

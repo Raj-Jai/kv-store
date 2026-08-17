@@ -13,9 +13,27 @@ import (
 // applies B's log-matching rule so Developer A can grade leader-side
 // replication without the real follower.
 type testFollower struct {
-	mu        sync.Mutex
-	log       []Entry
-	rejectAll bool
+	mu                sync.Mutex
+	log               []Entry
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	rejectAll         bool
+	snapshots         [][]byte
+}
+
+func (f *testFollower) lastLogIndex() int { return f.lastIncludedIndex + len(f.log) }
+
+func (f *testFollower) logTermAt(index int) int {
+	if index == 0 {
+		return 0
+	}
+	if index <= f.lastIncludedIndex {
+		return f.lastIncludedTerm
+	}
+	if off := index - f.lastIncludedIndex - 1; off < len(f.log) {
+		return f.log[off].Term
+	}
+	return -1
 }
 
 func (f *testFollower) handle(req AppendEntriesRequest) AppendEntriesResponse {
@@ -24,14 +42,34 @@ func (f *testFollower) handle(req AppendEntriesRequest) AppendEntriesResponse {
 	if f.rejectAll {
 		return AppendEntriesResponse{Term: req.Term, Success: false}
 	}
-	if req.PrevLogIndex > len(f.log) {
+	if req.PrevLogIndex > f.lastLogIndex() {
 		return AppendEntriesResponse{Term: req.Term, Success: false}
 	}
-	if req.PrevLogIndex > 0 && f.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+	if req.PrevLogIndex > 0 && f.logTermAt(req.PrevLogIndex) != req.PrevLogTerm {
 		return AppendEntriesResponse{Term: req.Term, Success: false}
 	}
-	f.log = append(f.log[:req.PrevLogIndex], req.Entries...)
+	keep := req.PrevLogIndex - f.lastIncludedIndex
+	if keep < 0 {
+		keep = 0
+	}
+	if keep > len(f.log) {
+		keep = len(f.log)
+	}
+	f.log = append(f.log[:keep], req.Entries...)
 	return AppendEntriesResponse{Term: req.Term, Success: true}
+}
+
+func (f *testFollower) install(req InstallSnapshotRequest) InstallSnapshotResponse {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rejectAll {
+		return InstallSnapshotResponse{Term: req.Term, Success: false}
+	}
+	f.log = nil
+	f.lastIncludedIndex = req.LastIncludedIndex
+	f.lastIncludedTerm = req.LastIncludedTerm
+	f.snapshots = append(f.snapshots, append([]byte(nil), req.Data...))
+	return InstallSnapshotResponse{Term: req.Term, Success: true}
 }
 
 func (f *testFollower) snapshot() []Entry {
@@ -64,6 +102,19 @@ func (t *followerTransport) AppendEntries(peer string, req AppendEntriesRequest)
 		return AppendEntriesResponse{Term: req.Term, Success: false}, nil
 	}
 	return f.handle(req), nil
+}
+
+func (t *followerTransport) InstallSnapshot(peer string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	if t.higherTerm > req.Term {
+		return InstallSnapshotResponse{Term: t.higherTerm, Success: false}, nil
+	}
+	t.mu.Lock()
+	f := t.followers[peer]
+	t.mu.Unlock()
+	if f == nil {
+		return InstallSnapshotResponse{Term: req.Term, Success: false}, nil
+	}
+	return f.install(req), nil
 }
 
 func leaderWithFollowers(t *testing.T, f *followerTransport, store storage.Engine) *Node {

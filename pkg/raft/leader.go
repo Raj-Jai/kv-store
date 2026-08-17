@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"log"
 
 	"github.com/Raj-Jai/kv-store/pkg/storage"
 )
@@ -98,9 +99,10 @@ func (n *Node) propose(cmd storage.Command) error {
 		return &storage.NotLeaderError{LeaderAddr: addr}
 	}
 	n.log = append(n.log, Entry{Term: n.term, Cmd: cmd})
+	n.dirty = true
 	singleNode := len(n.peers) == 0
 	if singleNode {
-		n.commitIndex = len(n.log)
+		n.commitIndex = n.lastLogIndex()
 	}
 	if singleNode {
 		n.mu.Unlock()
@@ -108,6 +110,12 @@ func (n *Node) propose(cmd storage.Command) error {
 	}
 	peers := append([]string(nil), n.peers...)
 	n.mu.Unlock()
+
+	// The leader's own copy of the entry must be durable before followers can
+	// be told about it.
+	if err := n.persist(); err != nil {
+		log.Printf("raft: persist log entry failed: %v", err)
+	}
 
 	for _, peer := range peers {
 		go n.replicateToPeer(peer)
@@ -137,14 +145,18 @@ func (n *Node) replicateToPeer(peer string) bool {
 		if next < 1 {
 			next = 1
 		}
-		prevLogIndex := next - 1
-		prevLogTerm := 0
-		if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
-			prevLogTerm = n.log[prevLogIndex-1].Term
+		if next < n.firstIndex() {
+			// The follower needs an entry that has been compacted into a
+			// snapshot; resync it via InstallSnapshot.
+			n.mu.Unlock()
+			return n.installSnapshot(peer)
 		}
+		prevLogIndex := next - 1
+		prevLogTerm := n.logTermAt(prevLogIndex)
 		var entries []Entry
-		if next <= len(n.log) {
-			entries = append([]Entry(nil), n.log[next-1:]...)
+		if next <= n.lastLogIndex() {
+			off := next - n.firstIndex()
+			entries = append([]Entry(nil), n.log[off:]...)
 		}
 		req := AppendEntriesRequest{
 			Term:         n.term,

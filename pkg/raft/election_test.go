@@ -14,6 +14,10 @@ func (grantTransport) AppendEntries(_ string, req AppendEntriesRequest) (AppendE
 	return AppendEntriesResponse{Term: req.Term, Success: true}, nil
 }
 
+func (grantTransport) InstallSnapshot(_ string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{Term: req.Term, Success: true}, nil
+}
+
 type denyTransport struct{}
 
 func (denyTransport) RequestVote(_ string, req VoteRequest) (VoteResponse, error) {
@@ -24,6 +28,10 @@ func (denyTransport) AppendEntries(_ string, req AppendEntriesRequest) (AppendEn
 	return AppendEntriesResponse{Term: req.Term, Success: true}, nil
 }
 
+func (denyTransport) InstallSnapshot(_ string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{Term: req.Term, Success: true}, nil
+}
+
 type higherTermTransport struct{ term int }
 
 func (t higherTermTransport) RequestVote(_ string, req VoteRequest) (VoteResponse, error) {
@@ -32,6 +40,10 @@ func (t higherTermTransport) RequestVote(_ string, req VoteRequest) (VoteRespons
 
 func (t higherTermTransport) AppendEntries(_ string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
 	return AppendEntriesResponse{Term: t.term, Success: false}, nil
+}
+
+func (t higherTermTransport) InstallSnapshot(_ string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{Term: t.term, Success: false}, nil
 }
 
 func elect(t *testing.T, n *Node) {

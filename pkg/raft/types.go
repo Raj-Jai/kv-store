@@ -31,8 +31,9 @@ const (
 	RoleLeader
 )
 
-// Entry is one entry in the replicated log. Position is implicit: entry i
-// lives at log index i+1.
+// Entry is one entry in the replicated log. Position is implicit: with the
+// compaction base lastIncludedIndex, the entry at slice offset o carries raft
+// log index lastIncludedIndex+1+o.
 type Entry struct {
 	Term int
 	Cmd  storage.Command
@@ -64,6 +65,22 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
+// InstallSnapshotRequest carries a compacted snapshot to a lagging follower
+// whose next needed log entry is older than the leader's first retained
+// entry. Data is the serialized state machine (Developer B's storage format).
+type InstallSnapshotRequest struct {
+	Term              int
+	LeaderID          string
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotResponse struct {
+	Term    int
+	Success bool
+}
+
 // Node is the shared raft state. Both the outbound engine (election.go) and
 // the inbound handlers (node.go) operate on it under n.mu.
 type Node struct {
@@ -85,6 +102,17 @@ type Node struct {
 	// repl is Developer A's leader-side replication state (M1.3). The type is
 	// defined in leader.go so the contract file stays minimal.
 	repl *replicationState
+
+	// Durability (M1.5) and compaction (M1.6).
+	raftStore        RaftStore
+	dirty            bool
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
+	// Snapshot machinery (M1.6): the leader pulls snapshots from a provider
+	// to resync lagging followers; followers hand snapshot data to a sink.
+	snapshotter  SnapshotProvider
+	snapshotSink SnapshotSink
 
 	transport Transport
 	store     storage.Engine
@@ -132,17 +160,56 @@ func (n *Node) LeaderID() (string, bool) {
 	return *n.leaderID, n.role == RoleLeader
 }
 
-// lastLogIndex returns the index of the last log entry (0 when empty).
+// lastLogIndex returns the raft index of the last log entry (0 when empty).
 func (n *Node) lastLogIndex() int {
-	return len(n.log)
+	return n.lastIncludedIndex + len(n.log)
 }
 
 // lastLogTerm returns the term of the last log entry (0 when empty).
 func (n *Node) lastLogTerm() int {
-	if len(n.log) == 0 {
+	if len(n.log) > 0 {
+		return n.log[len(n.log)-1].Term
+	}
+	return n.lastIncludedTerm
+}
+
+// firstIndex returns the first raft index still retained in the in-memory
+// log; any index below it has been compacted into a snapshot.
+func (n *Node) firstIndex() int {
+	return n.lastIncludedIndex + 1
+}
+
+// logOffset maps a raft log index to its offset in n.log, or -1 when the
+// entry has been compacted away (or is beyond the log).
+func (n *Node) logOffset(index int) int {
+	off := index - n.lastIncludedIndex - 1
+	if off < 0 || off >= len(n.log) {
+		return -1
+	}
+	return off
+}
+
+// entryAt returns the entry at the given raft log index.
+func (n *Node) entryAt(index int) (Entry, bool) {
+	if off := n.logOffset(index); off >= 0 {
+		return n.log[off], true
+	}
+	return Entry{}, false
+}
+
+// logTermAt returns the term of the entry at the given raft log index,
+// including the compacted base entry (lastIncludedIndex).
+func (n *Node) logTermAt(index int) int {
+	if index == 0 {
 		return 0
 	}
-	return n.log[len(n.log)-1].Term
+	if index == n.lastIncludedIndex {
+		return n.lastIncludedTerm
+	}
+	if e, ok := n.entryAt(index); ok {
+		return e.Term
+	}
+	return -1
 }
 
 // becomeCandidate starts a new election term and votes for itself.
@@ -152,6 +219,7 @@ func (n *Node) becomeCandidate() {
 	n.term++
 	n.votedFor = &n.id
 	n.leaderID = nil
+	n.dirty = true
 }
 
 // becomeLeader marks the node as the leader for its current term.
@@ -168,4 +236,5 @@ func (n *Node) becomeFollower(term int, leaderID *string) {
 	n.term = term
 	n.votedFor = nil
 	n.leaderID = leaderID
+	n.dirty = true
 }

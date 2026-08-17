@@ -39,6 +39,13 @@ func (t *HTTPTransport) AppendEntries(peer string, req AppendEntriesRequest) (Ap
 	return resp, err
 }
 
+// InstallSnapshot sends an InstallSnapshot to a peer and decodes the response.
+func (t *HTTPTransport) InstallSnapshot(peer string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	var resp InstallSnapshotResponse
+	err := t.do(peer, "/raft/snapshot", req, &resp)
+	return resp, err
+}
+
 func (t *HTTPTransport) do(peer, path string, in, out any) error {
 	body, err := json.Marshal(in)
 	if err != nil {
@@ -83,6 +90,13 @@ func ServeRaftHTTP(h RaftHandler) http.Handler {
 				return
 			}
 			writeRPC(w, h.HandleAppendEntries(req))
+		case "/raft/snapshot":
+			var req InstallSnapshotRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			writeRPC(w, h.HandleInstallSnapshot(req))
 		default:
 			http.NotFound(w, r)
 		}

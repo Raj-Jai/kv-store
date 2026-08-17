@@ -58,6 +58,15 @@ func (m *MemTransport) AppendEntries(peer string, req AppendEntriesRequest) (App
 	return h.HandleAppendEntries(req), nil
 }
 
+// InstallSnapshot dispatches an InstallSnapshot to the peer's handler.
+func (m *MemTransport) InstallSnapshot(peer string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	h, err := m.handler(peer)
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+	return h.HandleInstallSnapshot(req), nil
+}
+
 func (m *MemTransport) handler(peer string) (RaftHandler, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

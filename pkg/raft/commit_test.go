@@ -112,6 +112,26 @@ func TestCommitIndexAdvancesMonotonically(t *testing.T) {
 	}
 }
 
+func TestCommitTwoNodesRequiresBoth(t *testing.T) {
+	// Even cluster size: a 2-node cluster needs both nodes to commit.
+	followers := map[string]*testFollower{"f1": {}}
+	n := commitLeader(t, followers)
+	preload(n, 1, 3)
+
+	catchUp(t, n, "f1")
+	if got := commitIndex(n); got != 3 {
+		t.Fatalf("expected commitIndex 3 when both of 2 nodes agree, got %d", got)
+	}
+
+	// Only the leader has the entries: majority is 2 of 2, so nothing commits.
+	followers2 := map[string]*testFollower{"f1": {}}
+	n2 := commitLeader(t, followers2)
+	preload(n2, 1, 3)
+	if got := commitIndex(n2); got != 0 {
+		t.Fatalf("expected commitIndex 0 with only 1 of 2 nodes, got %d", got)
+	}
+}
+
 func TestCommitDoesNotLeapOverOlderTermEntries(t *testing.T) {
 	n := commitLeader(t, fiveFollowers())
 

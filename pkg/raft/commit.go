@@ -17,20 +17,25 @@ func (n *Node) maybeCommit() {
 	st := n.replState()
 
 	match := make([]int, 0, len(n.peers)+1)
-	match = append(match, len(n.log)) // the leader has its own log
+	match = append(match, n.lastLogIndex()) // the leader has its own log
 	for _, peer := range n.peers {
 		match = append(match, st.matchIndex[peer])
 	}
 	sort.Ints(match)
 
-	median := match[len(match)/2] // floor(N/2)+1 nodes replicate up to here
-	if median <= n.commitIndex {
+	// The highest index replicated on a majority is the value at position
+	// N-majority (0-indexed) in ascending order: that many nodes lag behind
+	// it, so exactly majority nodes have reached it.
+	threshold := match[len(match)-majority(n.peers)]
+	if threshold <= n.commitIndex {
 		return
 	}
 	// Raft commits older-term entries only via a committed current-term
 	// entry, so never leap past a non-current term.
-	if median > 0 && n.log[median-1].Term != n.term {
-		return
+	if threshold > 0 {
+		if e, ok := n.entryAt(threshold); !ok || e.Term != n.term {
+			return
+		}
 	}
-	n.commitIndex = median
+	n.commitIndex = threshold
 }

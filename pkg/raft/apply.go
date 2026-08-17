@@ -76,9 +76,14 @@ func (n *Node) applyLoop(ctx context.Context, tr *ApplyTracker) {
 		}
 		n.lastApplied++
 		idx := n.lastApplied
-		entry := n.log[idx-1]
+		entry, ok := n.entryAt(idx)
 		n.mu.Unlock()
 
+		if !ok {
+			// Already compacted into a snapshot and applied from it.
+			tr.applied(idx)
+			continue
+		}
 		if err := n.applyCmd(entry.Cmd); err != nil {
 			log.Printf("raft: apply entry %d failed: %v", idx, err)
 		}
