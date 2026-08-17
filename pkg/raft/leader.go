@@ -206,6 +206,7 @@ func (n *Node) replicateToPeer(peer string) bool {
 		if matched+1 > st.nextIndex[peer] {
 			st.nextIndex[peer] = matched + 1
 		}
+		n.maybeCommit()
 		n.mu.Unlock()
 		return true
 	}
