@@ -52,6 +52,22 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleWriteError maps a consensus "not the leader" error to an HTTP
+// response: a 307 redirect to the current leader, or a 503 when no leader is
+// known yet. It reports whether it consumed the error.
+func (s *Server) handleWriteError(w http.ResponseWriter, r *http.Request, err error) bool {
+	var nle *storage.NotLeaderError
+	if !errors.As(err, &nle) {
+		return false
+	}
+	if nle.LeaderAddr == "" {
+		http.Error(w, "no leader elected", http.StatusServiceUnavailable)
+		return true
+	}
+	http.Redirect(w, r, nle.LeaderAddr+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	return true
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	body, err := io.ReadAll(r.Body)
@@ -70,6 +86,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		s.metrics.IncrKeys()
 	}
 	if err := s.engine.Put(key, string(body)); err != nil {
+		if s.handleWriteError(w, r, err) {
+			return
+		}
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -83,6 +102,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		s.metrics.DecrKeys()
 	}
 	if err := s.engine.Delete(key); err != nil {
+		if s.handleWriteError(w, r, err) {
+			return
+		}
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}

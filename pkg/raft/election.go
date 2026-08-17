@@ -10,7 +10,7 @@ import (
 // electionTimeout returns a randomized timeout in [min, max). Randomized so
 // concurrent candidates do not always collide.
 func (n *Node) electionTimeout() time.Duration {
-	spread := int(electionTimeoutMax - electionTimeoutMin)
+	spread := int((electionTimeoutMax - electionTimeoutMin) / time.Millisecond)
 	return electionTimeoutMin + time.Duration(rand.IntN(spread))*time.Millisecond
 }
 

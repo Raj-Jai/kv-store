@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Raj-Jai/kv-store/pkg/api"
+	"github.com/Raj-Jai/kv-store/pkg/raft"
 	"github.com/Raj-Jai/kv-store/pkg/storage"
 	"github.com/Raj-Jai/kv-store/pkg/util"
 )
@@ -36,16 +38,47 @@ func main() {
 	}
 
 	logger := util.NewLogger()
-	server := api.NewServer(store, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Multi-node mode: when PEERS is set this node joins a raft cluster.
+	// NODE_ID is this node's reachable address (peers route RPCs to it).
+	var node *raft.Node
+	var engine storage.Engine = store
+	if peersRaw := os.Getenv("PEERS"); peersRaw != "" {
+		nodeID := envOr("NODE_ID", "http://127.0.0.1:"+port)
+		peers := strings.Split(peersRaw, ",")
+		node = raft.NewNode(nodeID, peers, &raft.HTTPTransport{}, store)
+		go node.Loop(ctx)
+		node.StartApply(ctx)
+		engine = node
+	}
+
+	server := api.NewServer(engine, logger)
+
+	var handler http.Handler = server.Handler()
+	if node != nil {
+		// Serve raft RPCs alongside the client API so peers can reach us.
+		raftHandler := raft.ServeRaftHTTP(node)
+		mux := http.NewServeMux()
+		mux.Handle("POST /raft/vote", raftHandler)
+		mux.Handle("POST /raft/append", raftHandler)
+		mux.Handle("/", handler)
+		handler = mux
+	}
 
 	httpServer := &http.Server{
 		Addr:    ":" + port,
-		Handler: server.Handler(),
+		Handler: handler,
 	}
 
-	logger.Info("kv-store starting", map[string]any{"port": port, "data_dir": dataDir})
+	logger.Info("kv-store starting", map[string]any{
+		"port": port, "data_dir": dataDir, "peers": os.Getenv("PEERS"),
+		"node_id": envOr("NODE_ID", ""),
+	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 1)
@@ -59,14 +92,20 @@ func main() {
 			logger.Error("server failed", map[string]any{"error": err.Error()})
 			log.Fatal(err)
 		}
-	case <-ctx.Done():
+	case <-sigCtx.Done():
 		logger.Info("shutdown signal received", nil)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", map[string]any{"error": err.Error()})
+	}
+
+	logger.Info("stopping raft node", nil)
+	cancel()
+	if node != nil {
+		node.Stop()
 	}
 
 	logger.Info("closing storage engine", nil)
