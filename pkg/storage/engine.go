@@ -13,7 +13,8 @@ type Engine interface {
 
 	// Incr atomically increments the base-10 integer stored at key by 1,
 	// creating it as "1" when absent, and returns the new value. The value
-	// must be a valid base-10 int64, otherwise ErrNotNumeric is returned.
+	// must be a valid base-10 int64 below its maximum, otherwise
+	// ErrNotNumeric (non-numeric) or ErrOverflow (would wrap) is returned.
 	Incr(key string) (int64, error)
 	// CAS swaps key to new only when its current value equals old. It
 	// returns (true, nil) on a swap, (false, nil) on a mismatch, and
@@ -45,6 +46,10 @@ var ErrClosed = errors.New("store closed")
 // ErrNotNumeric is returned by Incr when the stored value is not a base-10
 // integer.
 var ErrNotNumeric = errors.New("value is not a base-10 integer")
+
+// ErrOverflow is returned by Incr when the stored value is a base-10 int64 at
+// its maximum, so incrementing it would wrap.
+var ErrOverflow = errors.New("value overflows int64")
 
 // ErrInvalidCursor is returned by Scan when the cursor is malformed.
 var ErrInvalidCursor = errors.New("invalid scan cursor")

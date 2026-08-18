@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -64,6 +65,9 @@ func decodeWALPrefix(data []byte, now int64) map[string]entry {
 			v, err := strconv.ParseInt(e.Value, 10, 64)
 			if err != nil {
 				continue // non-numeric: deterministic no-op, like lenient replay
+			}
+			if v == math.MaxInt64 {
+				continue // overflow: failed at apply, replay is a no-op
 			}
 			state[key] = entry{Value: strconv.FormatInt(v+1, 10)}
 		case opCAS:

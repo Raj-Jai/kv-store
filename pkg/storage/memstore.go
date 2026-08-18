@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -115,6 +116,9 @@ func (m *MemStore) Incr(key string) (int64, error) {
 	v, err := strconv.ParseInt(e.Value, 10, 64)
 	if err != nil {
 		return 0, ErrNotNumeric
+	}
+	if v == math.MaxInt64 {
+		return 0, ErrOverflow
 	}
 	nv := v + 1
 	m.data[key] = entry{Value: strconv.FormatInt(nv, 10)}

@@ -178,10 +178,11 @@ func (w *WAL) Replay(m *MemStore) error {
 				return fmt.Errorf("read wal incr key: %w", err)
 			}
 			remaining -= n
-			// Deterministic re-evaluation: an incr of a non-numeric value
-			// failed at apply time with no state change, so replaying it is a
-			// no-op (mirrors the leniency applied to CAS/Expire below).
-			if _, err := m.Incr(key); err != nil && !errors.Is(err, ErrNotNumeric) {
+			// Deterministic re-evaluation: an incr that failed at apply time
+			// (non-numeric value, or overflow at int64 max) changed no state,
+			// so replaying it is a no-op (mirrors the leniency applied to
+			// CAS/Expire below).
+			if _, err := m.Incr(key); err != nil && !errors.Is(err, ErrNotNumeric) && !errors.Is(err, ErrOverflow) {
 				return fmt.Errorf("replay wal incr: %w", err)
 			}
 		case opCAS:

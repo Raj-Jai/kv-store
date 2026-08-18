@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -69,7 +70,9 @@ func (f *FakeEngine) WasCleared() bool {
 	return f.cleared
 }
 
-// Incr implements the Engine contract for the fake.
+// Incr implements the Engine contract for the fake, mirroring MemStore's
+// semantics exactly: an absent key becomes "1", a stored "" is non-numeric,
+// and incrementing int64 max overflows.
 func (f *FakeEngine) Incr(key string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -77,14 +80,17 @@ func (f *FakeEngine) Incr(key string) (int64, error) {
 		delete(f.data, key)
 		delete(f.expires, key)
 	}
-	cur := f.data[key]
-	if cur == "" {
+	cur, ok := f.data[key]
+	if !ok {
 		f.data[key] = "1"
 		return 1, nil
 	}
 	v, err := strconv.ParseInt(cur, 10, 64)
 	if err != nil {
 		return 0, ErrNotNumeric
+	}
+	if v == math.MaxInt64 {
+		return 0, ErrOverflow
 	}
 	f.data[key] = strconv.FormatInt(v+1, 10)
 	return v + 1, nil

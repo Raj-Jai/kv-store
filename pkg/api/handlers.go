@@ -155,6 +155,10 @@ func (s *Server) handleIncr(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "value is not a base-10 integer"})
 		return
 	}
+	if errors.Is(err, storage.ErrOverflow) {
+		s.writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "value overflows int64"})
+		return
+	}
 	if s.handleWriteError(w, r, err) {
 		return
 	}
@@ -212,10 +216,10 @@ func (s *Server) handleCAS(w http.ResponseWriter, r *http.Request) {
 // maxCount is the largest page Scan returns; maxCursorLen and maxPatternLen
 // bound the otherwise-unbounded query inputs.
 const (
-	defaultCount   = 100
-	maxCount       = 1000
-	maxCursorLen   = 4096
-	maxPatternLen  = 256
+	defaultCount  = 100
+	maxCount      = 1000
+	maxCursorLen  = 4096
+	maxPatternLen = 256
 )
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {

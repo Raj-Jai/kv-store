@@ -198,3 +198,66 @@ func TestIncrNonNumericThenCrashRestart(t *testing.T) {
 		t.Fatalf("Get = %q, want txt", v)
 	}
 }
+
+// TestMemStoreAndFakeIncrAgree guards the contract fake: the fake must mirror
+// the real store on the two Incr edges that previously diverged — a stored
+// empty string is non-numeric (not "absent"), and incrementing int64 max
+// overflows.
+func TestMemStoreAndFakeIncrAgree(t *testing.T) {
+	for _, eng := range []Engine{NewMemStore(), NewFakeEngine()} {
+		if err := eng.Put("empty", ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Incr("empty"); !errors.Is(err, ErrNotNumeric) {
+			t.Fatalf("%T Incr(empty string) = %v, want ErrNotNumeric", eng, err)
+		}
+
+		if err := eng.Put("max", "9223372036854775807"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Incr("max"); !errors.Is(err, ErrOverflow) {
+			t.Fatalf("%T Incr(int64 max) = %v, want ErrOverflow", eng, err)
+		}
+	}
+}
+
+// TestIncrOverflowThenCrashRestart guards the same bricking hazard as the
+// non-numeric case: an overflowed Incr is WAL-logged before the memory apply,
+// so replay must re-evaluate it as a no-op rather than refusing to start.
+func TestIncrOverflowThenCrashRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenDiskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put("k", "9223372036854775807"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Incr("k"); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("Incr = %v, want ErrOverflow", err)
+	}
+
+	crash := t.TempDir()
+	for _, name := range []string{"wal.log", "snapshot.dat"} {
+		src := filepath.Join(dir, name)
+		if _, err := os.Stat(src); err == nil {
+			data, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(crash, name), data, 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s.Close()
+
+	restored, err := OpenDiskStore(crash)
+	if err != nil {
+		t.Fatalf("crash-restart after overflowed Incr: %v", err)
+	}
+	defer restored.Close()
+	if v, _ := restored.Get("k"); v != "9223372036854775807" {
+		t.Fatalf("Get = %q, want 9223372036854775807", v)
+	}
+}

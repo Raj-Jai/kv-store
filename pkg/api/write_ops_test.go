@@ -91,6 +91,14 @@ func TestIncrNonNumericReturns422(t *testing.T) {
 	}
 }
 
+func TestIncrOverflowReturns422(t *testing.T) {
+	s := newTestServer()
+	doRequest(t, s, http.MethodPut, "/kv/max", "9223372036854775807")
+	if rec := doRequest(t, s, http.MethodPost, "/kv/max/incr", ""); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("incr overflow = %d, want 422", rec.Code)
+	}
+}
+
 func TestCAS(t *testing.T) {
 	s := newTestServer()
 	doRequest(t, s, http.MethodPut, "/kv/k", "a")
