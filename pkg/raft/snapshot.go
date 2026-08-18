@@ -154,7 +154,13 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	}
 	n.resetElectionTimer()
 
-	installed := req.LastIncludedIndex > n.lastIncludedIndex
+	// A snapshot is only useful when it advances the state machine: it must
+	// cover entries the node has not applied yet. A snapshot at or behind the
+	// node's applied index (a duplicate, reordered, or delayed copy of one the
+	// node already caught up past) must be acknowledged but ignored, otherwise
+	// restoring its data would roll the state machine back to an older state
+	// and resurrect values that were already overwritten or deleted.
+	installed := req.LastIncludedIndex > n.lastApplied
 	if installed {
 		drop := req.LastIncludedIndex - n.lastIncludedIndex
 		if drop > len(n.log) {

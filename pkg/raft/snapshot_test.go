@@ -211,6 +211,51 @@ func TestHandleInstallSnapshotTrimsCoveredEntries(t *testing.T) {
 	}
 }
 
+// TestHandleInstallSnapshotStaleSnapshotIgnored guards against rolling the
+// state machine back: a snapshot whose base is at or behind the follower's
+// applied index (a duplicate, reordered, or delayed copy of one the node
+// already caught up past) must be acknowledged but must NOT restore its data
+// or trim the log.
+func TestHandleInstallSnapshotStaleSnapshotIgnored(t *testing.T) {
+	sink := &recSink{}
+	n := NewNode("a", []string{"p1"}, FakeTransport{}, storage.NewFakeEngine())
+	n.SetSnapshotSink(sink)
+	n.mu.Lock()
+	// The node has already applied through index 100.
+	n.lastApplied = 100
+	n.lastIncludedIndex = 0
+	n.log = []Entry{
+		{Term: 2, Cmd: storage.Command{Op: storage.OpPut, Key: "k99"}},
+		{Term: 2, Cmd: storage.Command{Op: storage.OpPut, Key: "k100"}},
+	}
+	n.mu.Unlock()
+
+	resp := n.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              3,
+		LeaderID:          "L",
+		LastIncludedIndex: 50,
+		LastIncludedTerm:  2,
+		Data:              []byte("state-at-50"),
+	})
+	if !resp.Success {
+		t.Fatal("a stale snapshot must still be acknowledged so the leader advances")
+	}
+	n.mu.Lock()
+	if n.lastIncludedIndex != 0 {
+		t.Fatalf("stale snapshot must not advance the base, got %d", n.lastIncludedIndex)
+	}
+	if len(n.log) != 2 {
+		t.Fatalf("stale snapshot must not trim the log, got %d entries", len(n.log))
+	}
+	if n.lastApplied != 100 {
+		t.Fatalf("stale snapshot must not move lastApplied, got %d", n.lastApplied)
+	}
+	n.mu.Unlock()
+	if got := sink.got(); got != nil {
+		t.Fatalf("stale snapshot must not apply data, got %q", got)
+	}
+}
+
 func TestHandleInstallSnapshotLowerTermRejected(t *testing.T) {
 	n := NewNode("a", []string{"p1"}, FakeTransport{}, storage.NewFakeEngine())
 	n.mu.Lock()
