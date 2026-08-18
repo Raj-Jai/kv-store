@@ -1,0 +1,15 @@
+.git
+.gitignore
+data
+mydata
+benchmarks
+request_test
+docs
+*.log
+*.dat
+*.tmp
+**/*.crt
+**/*.key
+**/*.pem
+Dockerfile
+docker-compose.yml

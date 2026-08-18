@@ -168,6 +168,15 @@ func (n *Node) LeaderID() (string, bool) {
 	return *n.leaderID, n.role == RoleLeader
 }
 
+// HasLeader reports whether this node currently knows a leader (itself or a
+// peer). A follower whose leader is unknown is not ready to serve writes; used
+// by readiness probes.
+func (n *Node) HasLeader() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.leaderID != nil
+}
+
 // lastLogIndex returns the raft index of the last log entry (0 when empty).
 func (n *Node) lastLogIndex() int {
 	return n.lastIncludedIndex + len(n.log)

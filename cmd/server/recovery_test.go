@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -31,6 +32,7 @@ type diskCluster struct {
 	trans *raft.MemTransport
 	nodes []*diskNode // currently alive nodes
 	ids   []string
+	key   []byte // at-rest encryption key; nil keeps nodes in plaintext mode
 }
 
 func newDiskCluster(t *testing.T) *diskCluster {
@@ -38,6 +40,27 @@ func newDiskCluster(t *testing.T) *diskCluster {
 	c := &diskCluster{t: t, trans: raft.NewMemTransport()}
 	for i := 0; i < clusterSize; i++ {
 		c.ids = append(c.ids, fmt.Sprintf("c%d", i))
+	}
+	for _, id := range c.ids {
+		c.startNode(t.TempDir(), id)
+	}
+	t.Cleanup(func() {
+		for _, d := range c.nodes {
+			d.node.Stop()
+			d.store.Close()
+		}
+	})
+	return c
+}
+
+// newEncryptedDiskCluster is newDiskCluster with at-rest encryption on every
+// node: the DiskStore WAL/snapshots and the raft log are all sealed with the
+// same key, mirroring cmd/server wiring.
+func newEncryptedDiskCluster(t *testing.T, key []byte) *diskCluster {
+	t.Helper()
+	c := &diskCluster{t: t, trans: raft.NewMemTransport(), key: key}
+	for i := 0; i < clusterSize; i++ {
+		c.ids = append(c.ids, fmt.Sprintf("e%d", i))
 	}
 	for _, id := range c.ids {
 		c.startNode(t.TempDir(), id)
@@ -63,12 +86,25 @@ func (c *diskCluster) startNode(dir, id string) *diskNode {
 	}
 
 	store, err := storage.OpenDiskStore(filepath.Join(dir, "data"))
+	if c.key != nil {
+		store, err = storage.OpenDiskStoreWithKey(filepath.Join(dir, "data"), c.key)
+	}
 	if err != nil {
 		c.t.Fatalf("open store for %s: %v", id, err)
 	}
 	node := raft.NewNode(id, peers, c.trans, store)
-	if err := node.SetRaftStore(raft.NewFileRaftStore(filepath.Join(dir, "raft.json"))); err != nil {
-		c.t.Fatalf("set raft store for %s: %v", id, err)
+	if c.key == nil {
+		if err := node.SetRaftStore(raft.NewFileRaftStore(filepath.Join(dir, "raft.json"))); err != nil {
+			c.t.Fatalf("set raft store for %s: %v", id, err)
+		}
+	} else {
+		enc, err := storage.NewAtRestCipher(c.key)
+		if err != nil {
+			c.t.Fatalf("cipher for %s: %v", id, err)
+		}
+		if err := node.SetRaftStore(raft.NewEncryptedFileRaftStore(filepath.Join(dir, "raft.json"), enc)); err != nil {
+			c.t.Fatalf("set raft store for %s: %v", id, err)
+		}
 	}
 	bridge := &snapshotBridge{node: node, store: store}
 	node.SetSnapshotter(bridge)
@@ -325,5 +361,41 @@ func TestCompactionBaseSurvivesRestart(t *testing.T) {
 	}
 	if base := restarted.node.SnapshotBase(); base != idx {
 		t.Fatalf("compaction base not durable across restart: got %d, want %d", base, idx)
+	}
+}
+
+// TestEncryptedClusterNoPlaintextOnDisk proves the at-rest guarantee end to
+// end: with a key configured, an acked write, its raft log entry, and any
+// snapshot must never appear in plaintext in any node's data directory — and
+// the acked write must survive a leader restart on the same key.
+func TestEncryptedClusterNoPlaintextOnDisk(t *testing.T) {
+	key := bytes.Repeat([]byte{0x2b}, storage.AtRestKeySize)
+	c := newEncryptedDiskCluster(t, key)
+	c.waitLeader(5 * time.Second)
+
+	c.writeAcked("secret", "classified-73")
+	c.waitStore("secret", "classified-73", 5*time.Second)
+
+	for _, d := range c.nodes {
+		hits, err := findStrings(d.dir, "classified-73")
+		if err != nil {
+			t.Fatalf("scan %s: %v", d.id, err)
+		}
+		if len(hits) > 0 {
+			t.Fatalf("node %s leaked plaintext value in %v", d.id, hits)
+		}
+	}
+
+	leader := c.waitLeader(5 * time.Second)
+	c.stop(leader)
+	restarted := c.startNode(leader.dir, leader.id)
+	c.waitNodeStore(restarted, "secret", "classified-73", 15*time.Second)
+
+	hits, err := findStrings(leader.dir, "classified-73")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) > 0 {
+		t.Fatalf("restarted node leaked plaintext value in %v", hits)
 	}
 }

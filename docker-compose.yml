@@ -1,0 +1,86 @@
+# 5-node raft cluster. Any node serves the client API; writes are forwarded to
+# the leader; restarting a container lets the cluster heal.
+#
+#   docker compose up --build -d
+#   curl -X PUT http://localhost:8081/kv/hello -d world
+#   curl http://localhost:8083/kv/hello          # reads from any node
+#   docker compose restart kv2                   # SIGTERM -> graceful shutdown
+#   curl http://localhost:8081/kv/hello          # still there, cluster healed
+#
+# Data is encrypted at rest with AES-256 (the same demo key on every node; the
+# value is 32 bytes = 64 hex chars). Set ENCRYPTION_KEY to your own key:
+#   ENCRYPTION_KEY=<your 64-hex key> docker compose up -d
+# A key file mounted at /keys/enc.key (KEY_FILE=/keys/enc.key) also works.
+
+services:
+  kv1: &kv
+    build: .
+    container_name: kv1
+    environment: &env
+      NODE_ID: http://kv1:8081
+      PEERS: &peers http://kv2:8081,http://kv3:8081,http://kv4:8081,http://kv5:8081
+      DATA_DIR: /data
+      PORT: "8081"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+    volumes:
+      - kv-data-1:/data
+    ports:
+      - "8081:8081"
+    healthcheck: &health
+      test: ["CMD", "wget", "-qO", "-", "http://127.0.0.1:8081/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  kv2:
+    <<: *kv
+    container_name: kv2
+    environment:
+      <<: *env
+      NODE_ID: http://kv2:8081
+    volumes:
+      - kv-data-2:/data
+    ports:
+      - "8082:8081"
+
+  kv3:
+    <<: *kv
+    container_name: kv3
+    environment:
+      <<: *env
+      NODE_ID: http://kv3:8081
+    volumes:
+      - kv-data-3:/data
+    ports:
+      - "8083:8081"
+
+  kv4:
+    <<: *kv
+    container_name: kv4
+    environment:
+      <<: *env
+      NODE_ID: http://kv4:8081
+    volumes:
+      - kv-data-4:/data
+    ports:
+      - "8084:8081"
+
+  kv5:
+    <<: *kv
+    container_name: kv5
+    environment:
+      <<: *env
+      NODE_ID: http://kv5:8081
+    volumes:
+      - kv-data-5:/data
+    ports:
+      - "8085:8081"
+
+volumes:
+  kv-data-1:
+  kv-data-2:
+  kv-data-3:
+  kv-data-4:
+  kv-data-5:
