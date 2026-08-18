@@ -74,11 +74,11 @@ func BenchmarkHandlerIncr(b *testing.B) {
 
 func BenchmarkHandlerCas(b *testing.B) {
 	s := newTestServer()
-	if err := s.engine.Put("key", "a"); err != nil {
-		b.Fatal(err)
-	}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		if err := s.engine.Put("key", "a"); err != nil {
+			b.Fatal(err)
+		}
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPut, "/kv/key/cas", strings.NewReader(`{"old":"a","new":"b"}`))
 		s.Handler().ServeHTTP(rec, req)
