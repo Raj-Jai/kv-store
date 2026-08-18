@@ -21,7 +21,7 @@ const snapshotVersion = 2
 
 // snapshotFile is the version-2 on-disk snapshot envelope.
 type snapshotFile struct {
-	V    int            `json:"v"`
+	V    int              `json:"v"`
 	Data map[string]entry `json:"data"`
 }
 

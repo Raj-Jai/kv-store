@@ -75,9 +75,9 @@ func (s *Server) recoverPanic(next http.Handler) http.Handler {
 		defer func() {
 			if err := recover(); err != nil {
 				s.logger.Error("panic recovered", map[string]any{
-					"error":   err,
-					"method":  r.Method,
-					"path":    r.URL.Path,
+					"error":  err,
+					"method": r.Method,
+					"path":   r.URL.Path,
 				})
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
