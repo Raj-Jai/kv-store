@@ -1,6 +1,9 @@
 package storage
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 const (
 	// maxBatchSize bounds the number of operations flushed in one fsync.
@@ -12,15 +15,21 @@ const (
 
 // batchRequest is a queued mutation awaiting a durable write.
 type batchRequest struct {
-	op      opCode
-	key     string
-	value   string
-	errChan chan error
+	op        opCode
+	key       string
+	old       string
+	value     string
+	expiresAt int64
+	result    any
+	errChan   chan error
 }
 
 // batchLoop collects writes into batches and decides when to write each batch
-// with a single fsync: when it is full or after flushInterval. Closing
-// batchChan writes the remainder and signals batchDone.
+// with a single fsync: when it is full or after flushInterval. Ops that need
+// the current memory state to decide their outcome (Incr/CAS/Expire) are
+// never batched: the pending batch is flushed first so they see every prior
+// acknowledged write, then they are processed singly. Closing batchChan
+// writes the remainder and signals batchDone.
 func (s *DiskStore) batchLoop() {
 	var batch []*batchRequest
 	var timer *time.Timer
@@ -33,6 +42,17 @@ func (s *DiskStore) batchLoop() {
 				s.writeBatch(batch)
 				close(s.batchDone)
 				return
+			}
+			if req.op >= opIncr {
+				s.writeBatch(batch)
+				batch = nil
+				if timer != nil {
+					timer.Stop()
+					timer = nil
+					timerC = nil
+				}
+				s.writeSingle(req)
+				continue
 			}
 			batch = append(batch, req)
 			if timer == nil {
@@ -54,6 +74,77 @@ func (s *DiskStore) batchLoop() {
 			timerC = nil
 		}
 	}
+}
+
+// writeSingle durably executes one state-dependent write. The batch is empty
+// at this point, so the memory state reflects every prior acknowledged write.
+func (s *DiskStore) writeSingle(req *batchRequest) {
+	s.snapMu.Lock()
+
+	var finalErr error
+	switch req.op {
+	case opIncr:
+		if err := s.wal.AppendIncr(req.key); err != nil {
+			finalErr = err
+			break
+		}
+		if err := s.wal.Sync(); err != nil {
+			finalErr = err
+			break
+		}
+		v, err := s.mem.Incr(req.key)
+		if err != nil {
+			finalErr = err
+			break
+		}
+		req.result = v
+	case opCAS:
+		cur, gerr := s.mem.Get(req.key)
+		if errors.Is(gerr, ErrNotFound) {
+			finalErr = ErrNotFound
+			break
+		}
+		if gerr != nil {
+			finalErr = gerr
+			break
+		}
+		if cur != req.old {
+			req.result = false
+			break
+		}
+		if err := s.wal.AppendCAS(req.key, req.old, req.value); err != nil {
+			finalErr = err
+			break
+		}
+		if err := s.wal.Sync(); err != nil {
+			finalErr = err
+			break
+		}
+		s.mem.Put(req.key, req.value)
+		req.result = true
+	case opExpire:
+		if _, gerr := s.mem.Get(req.key); errors.Is(gerr, ErrNotFound) {
+			finalErr = ErrNotFound
+			break
+		} else if gerr != nil {
+			finalErr = gerr
+			break
+		}
+		if err := s.wal.AppendExpire(req.key, req.expiresAt); err != nil {
+			finalErr = err
+			break
+		}
+		if err := s.wal.Sync(); err != nil {
+			finalErr = err
+			break
+		}
+		finalErr = s.mem.Expire(req.key, req.expiresAt)
+	default:
+		finalErr = errors.New("storage: unexpected single op")
+	}
+
+	s.snapMu.Unlock()
+	req.errChan <- finalErr
 }
 
 // writeBatch appends the batch to the WAL, performs a single fsync, then

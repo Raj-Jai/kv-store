@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -12,19 +13,32 @@ import (
 // order, and notifies waiters that an index has been applied.
 
 // ApplyTracker tracks per-index waiters so callers can block until a log
-// entry has been applied (e.g. before answering an HTTP write).
+// entry has been applied (e.g. before answering an HTTP write), and records
+// the result each applied entry produced.
 type ApplyTracker struct {
 	mu      sync.Mutex
 	waiters map[int][]chan struct{}
+	results map[int]applyResult
+}
+
+// applyResult is what applying one log entry produced. val is non-nil only
+// for ops that return a value (Incr's new value, CAS's outcome).
+type applyResult struct {
+	val any
+	err error
 }
 
 func newApplyTracker() *ApplyTracker {
-	return &ApplyTracker{waiters: make(map[int][]chan struct{})}
+	return &ApplyTracker{
+		waiters: make(map[int][]chan struct{}),
+		results: make(map[int]applyResult),
+	}
 }
 
 // WaitIndex returns a channel that is closed once log index i has been
 // applied. If the index is never committed the caller must time out on its
-// own.
+// own. The result of applying i is available via Result once the channel is
+// closed.
 func (t *ApplyTracker) WaitIndex(i int) <-chan struct{} {
 	ch := make(chan struct{})
 	t.mu.Lock()
@@ -33,8 +47,21 @@ func (t *ApplyTracker) WaitIndex(i int) <-chan struct{} {
 	return ch
 }
 
-func (t *ApplyTracker) applied(i int) {
+// Result returns the apply result for an index whose waiter channel has been
+// closed.
+func (t *ApplyTracker) Result(i int) (any, error) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.results[i]
+	if !ok {
+		return nil, errors.New("raft: no apply result recorded for index")
+	}
+	return r.val, r.err
+}
+
+func (t *ApplyTracker) applied(i int, r applyResult) {
+	t.mu.Lock()
+	t.results[i] = r
 	for _, ch := range t.waiters[i] {
 		close(ch)
 	}
@@ -75,9 +102,14 @@ func (n *Node) Flush() error {
 
 // StartApply launches the apply loop as a single goroutine and returns a
 // tracker for callers that want to block until a specific index is applied.
-// The loop ends when ctx is cancelled or the node is stopped.
+// The tracker is also retained on the node so state-dependent writes
+// (Incr/CAS/Expire) can wait for their own apply result. The loop ends when
+// ctx is cancelled or the node is stopped.
 func (n *Node) StartApply(ctx context.Context) *ApplyTracker {
 	tr := newApplyTracker()
+	n.mu.Lock()
+	n.applyTr = tr
+	n.mu.Unlock()
 	go n.applyLoop(ctx, tr)
 	return tr
 }
@@ -105,12 +137,13 @@ func (n *Node) applyLoop(ctx context.Context, tr *ApplyTracker) {
 
 		if !ok {
 			// Already compacted into a snapshot and applied from it.
-			tr.applied(idx)
+			tr.applied(idx, applyResult{})
 			continue
 		}
-		if err := n.applyCmd(entry.Cmd); err != nil {
+		res, err := n.applyCmd(entry.Cmd)
+		if err != nil {
 			log.Printf("raft: apply entry %d failed: %v", idx, err)
 		}
-		tr.applied(idx)
+		tr.applied(idx, applyResult{val: res, err: err})
 	}
 }

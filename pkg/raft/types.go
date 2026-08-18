@@ -117,6 +117,8 @@ type Node struct {
 	transport Transport
 	store     storage.Engine
 
+	applyTr *ApplyTracker // set by StartApply; used by state-dependent writes
+
 	resetElection chan struct{}
 	stop          chan struct{}
 }

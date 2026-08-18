@@ -15,6 +15,16 @@ const (
 	snapshotThreshold = 1024 * 1024 // WAL size in bytes that triggers compaction
 )
 
+// snapshotVersion is the on-disk snapshot format. Version 1 was the raw
+// map[string]string; version 2 wraps the data in an envelope so TTLs persist.
+const snapshotVersion = 2
+
+// snapshotFile is the version-2 on-disk snapshot envelope.
+type snapshotFile struct {
+	V    int            `json:"v"`
+	Data map[string]entry `json:"data"`
+}
+
 // snapshotLoop periodically compacts the store once the WAL exceeds
 // snapshotThreshold, so the log never grows unbounded.
 func (s *DiskStore) snapshotLoop() {
@@ -57,7 +67,7 @@ func (s *DiskStore) compact() error {
 // saveSnapshot serializes memory state to snapshot.dat atomically.
 func (s *DiskStore) saveSnapshot() error {
 	s.mem.mu.RLock()
-	data, err := json.Marshal(s.mem.data)
+	data, err := json.Marshal(snapshotFile{V: snapshotVersion, Data: s.mem.data})
 	s.mem.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
@@ -74,7 +84,7 @@ func (s *DiskStore) SerializeSnapshot() ([]byte, error) {
 
 	s.mem.mu.RLock()
 	defer s.mem.mu.RUnlock()
-	data, err := json.Marshal(s.mem.data)
+	data, err := json.Marshal(snapshotFile{V: snapshotVersion, Data: s.mem.data})
 	if err != nil {
 		return nil, fmt.Errorf("marshal snapshot: %w", err)
 	}
@@ -88,15 +98,14 @@ func (s *DiskStore) RestoreSnapshot(data []byte) error {
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
 
-	// Replace, not merge: unmarshal into a fresh map so keys absent from the
+	// Replace, not merge: decode into a fresh map so keys absent from the
 	// snapshot (e.g. deleted before the leader took it) do not survive in the
 	// follower's state machine.
-	fresh := make(map[string]string)
-	s.mem.mu.Lock()
-	if err := json.Unmarshal(data, &fresh); err != nil {
-		s.mem.mu.Unlock()
-		return fmt.Errorf("unmarshal snapshot: %w", err)
+	fresh := make(map[string]entry)
+	if err := decodeSnapshot(data, fresh); err != nil {
+		return err
 	}
+	s.mem.mu.Lock()
 	s.mem.data = fresh
 	s.mem.mu.Unlock()
 
@@ -132,8 +141,32 @@ func (s *DiskStore) loadSnapshot() error {
 		}
 		return fmt.Errorf("read snapshot: %w", err)
 	}
-	if err := json.Unmarshal(data, &s.mem.data); err != nil {
+	fresh := make(map[string]entry)
+	if err := decodeSnapshot(data, fresh); err != nil {
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+	s.mem.data = fresh
+	return nil
+}
+
+// decodeSnapshot parses a snapshot blob into dst. It accepts the version-2
+// envelope, and migrates version-1 snapshots (a raw map[string]string) so
+// old data directories still load.
+func decodeSnapshot(data []byte, dst map[string]entry) error {
+	var sf snapshotFile
+	if err := json.Unmarshal(data, &sf); err == nil && (sf.V > 0 || sf.Data != nil) {
+		for k, e := range sf.Data {
+			dst[k] = e
+		}
+		return nil
+	}
+
+	var v1 map[string]string
+	if err := json.Unmarshal(data, &v1); err != nil {
 		return fmt.Errorf("unmarshal snapshot: %w", err)
+	}
+	for k, v := range v1 {
+		dst[k] = entry{Value: v}
 	}
 	return nil
 }

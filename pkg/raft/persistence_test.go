@@ -223,7 +223,7 @@ func TestUnknownOpErrorIsNotDirty(t *testing.T) {
 	n.mu.Lock()
 	n.becomeLeader()
 	n.mu.Unlock()
-	if err := n.applyCmd(storage.Command{Op: 42}); err == nil {
+	if _, err := n.applyCmd(storage.Command{Op: 42}); err == nil {
 		t.Fatal("expected error for unknown op")
 	}
 }

@@ -3,11 +3,13 @@ package storage
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // opCode identifies the type of a WAL record.
@@ -17,6 +19,9 @@ const (
 	opPut opCode = iota + 1
 	opDelete
 	opClear
+	opIncr
+	opCAS
+	opExpire
 )
 
 // maxRecordField bounds a single key/value payload in a WAL record. The HTTP
@@ -63,6 +68,40 @@ func (w *WAL) AppendDelete(key string) error {
 
 func (w *WAL) AppendClear() error {
 	return w.append([]byte{byte(opClear)})
+}
+
+// AppendIncr logs an increment of key. Replay re-evaluates the arithmetic,
+// which is deterministic given an identical prefix.
+func (w *WAL) AppendIncr(key string) error {
+	buf := make([]byte, 0, 5+len(key))
+	buf = append(buf, byte(opIncr))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(key)))
+	buf = append(buf, key...)
+	return w.append(buf)
+}
+
+// AppendCAS logs a compare-and-swap of key. The record is written only when
+// the compare matched at append time; replay re-evaluates the compare.
+func (w *WAL) AppendCAS(key, old, new string) error {
+	buf := make([]byte, 0, 9+len(key)+len(old)+len(new))
+	buf = append(buf, byte(opCAS))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(key)))
+	buf = append(buf, key...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(old)))
+	buf = append(buf, old...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(new)))
+	buf = append(buf, new...)
+	return w.append(buf)
+}
+
+// AppendExpire logs an absolute expiry deadline (unix nanoseconds) for key.
+func (w *WAL) AppendExpire(key string, expiresAt int64) error {
+	buf := make([]byte, 0, 13+len(key))
+	buf = append(buf, byte(opExpire))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(key)))
+	buf = append(buf, key...)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(expiresAt))
+	return w.append(buf)
 }
 
 func (w *WAL) append(b []byte) error {
@@ -133,6 +172,55 @@ func (w *WAL) Replay(m *MemStore) error {
 			m.Delete(key)
 		case opClear:
 			m.Clear()
+		case opIncr:
+			key, n, err := readString(r, remaining)
+			if err != nil {
+				return fmt.Errorf("read wal incr key: %w", err)
+			}
+			remaining -= n
+			if _, err := m.Incr(key); err != nil {
+				return fmt.Errorf("replay wal incr: %w", err)
+			}
+		case opCAS:
+			key, n, err := readString(r, remaining)
+			if err != nil {
+				return fmt.Errorf("read wal cas key: %w", err)
+			}
+			remaining -= n
+			old, n, err := readString(r, remaining)
+			if err != nil {
+				return fmt.Errorf("read wal cas old: %w", err)
+			}
+			remaining -= n
+			new, n, err := readString(r, remaining)
+			if err != nil {
+				return fmt.Errorf("read wal cas new: %w", err)
+			}
+			remaining -= n
+			// Deterministic re-evaluation: a CAS whose key is absent is a
+			// no-op, exactly as it would have been at apply time.
+			if _, err := m.CAS(key, old, new); err != nil && !errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("replay wal cas: %w", err)
+			}
+		case opExpire:
+			key, n, err := readString(r, remaining)
+			if err != nil {
+				return fmt.Errorf("read wal expire key: %w", err)
+			}
+			remaining -= n
+			if remaining < 8 {
+				return fmt.Errorf("read wal expire ts: %w", io.ErrUnexpectedEOF)
+			}
+			var tsBuf [8]byte
+			if _, err := io.ReadFull(r, tsBuf[:]); err != nil {
+				return fmt.Errorf("read wal expire ts: %w", err)
+			}
+			remaining -= 8
+			expiresAt := int64(binary.BigEndian.Uint64(tsBuf[:]))
+			// Deterministic re-evaluation: expiring an absent key is a no-op.
+			if err := m.Expire(key, expiresAt); err != nil && !errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("replay wal expire: %w", err)
+			}
 		default:
 			return fmt.Errorf("corrupted wal: unknown op code %d", op)
 		}
@@ -180,6 +268,8 @@ type DiskStore struct {
 
 	stopSnap  chan struct{}
 	snapDone  chan struct{}
+	stopExp   chan struct{}
+	expDone   chan struct{}
 	closeOnce sync.Once
 	closeMu   sync.RWMutex // guards the closed flag and batchChan shutdown
 	closed    bool
@@ -206,6 +296,8 @@ func OpenDiskStore(dataDir string) (*DiskStore, error) {
 		batchDone:    make(chan struct{}),
 		stopSnap:     make(chan struct{}),
 		snapDone:     make(chan struct{}),
+		stopExp:      make(chan struct{}),
+		expDone:      make(chan struct{}),
 	}
 
 	if err := s.loadSnapshot(); err != nil {
@@ -219,6 +311,7 @@ func OpenDiskStore(dataDir string) (*DiskStore, error) {
 
 	go s.batchLoop()
 	go s.snapshotLoop()
+	go s.expireLoop()
 
 	return s, nil
 }
@@ -228,28 +321,73 @@ func (s *DiskStore) Get(key string) (string, error) {
 }
 
 func (s *DiskStore) Put(key, value string) error {
-	return s.submit(&batchRequest{op: opPut, key: key, value: value})
+	_, err := s.submit(&batchRequest{op: opPut, key: key, value: value})
+	return err
 }
 
 func (s *DiskStore) Delete(key string) error {
-	return s.submit(&batchRequest{op: opDelete, key: key})
+	_, err := s.submit(&batchRequest{op: opDelete, key: key})
+	return err
 }
 
 func (s *DiskStore) Clear() error {
-	return s.submit(&batchRequest{op: opClear})
+	_, err := s.submit(&batchRequest{op: opClear})
+	return err
 }
+
+// Incr atomically increments key by 1 and returns the new value. It is
+// serialized with every other write and durable before the memory state
+// changes.
+func (s *DiskStore) Incr(key string) (int64, error) {
+	res, err := s.submit(&batchRequest{op: opIncr, key: key})
+	if err != nil {
+		return 0, err
+	}
+	return res.(int64), nil
+}
+
+// CAS swaps key to new when its value equals old, returning true on success
+// and false on a mismatch (ErrNotFound when the key is absent).
+func (s *DiskStore) CAS(key, old, new string) (bool, error) {
+	res, err := s.submit(&batchRequest{op: opCAS, key: key, old: old, value: new})
+	if err != nil {
+		return false, err
+	}
+	return res.(bool), nil
+}
+
+// Expire sets an absolute expiry deadline (unix nanoseconds) for key.
+func (s *DiskStore) Expire(key string, expiresAt int64) error {
+	_, err := s.submit(&batchRequest{op: opExpire, key: key, expiresAt: expiresAt})
+	return err
+}
+
+// Scan pages over live keys sorting after cursor that match pattern.
+func (s *DiskStore) Scan(cursor string, count int, pattern string) ([]KeyValue, string, error) {
+	return s.mem.Scan(cursor, count, pattern)
+}
+
+// Size returns the number of live keys.
+func (s *DiskStore) Size() int { return s.mem.Size() }
+
+// ExpiredCount reports how many keys the store has dropped by expiry.
+func (s *DiskStore) ExpiredCount() uint64 { return s.mem.ExpiredCount() }
 
 // submit queues a mutation and blocks until it is durable. Writes issued after
 // the store is closed return ErrClosed.
-func (s *DiskStore) submit(req *batchRequest) error {
+func (s *DiskStore) submit(req *batchRequest) (any, error) {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if s.closed {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	req.errChan = make(chan error, 1)
 	s.batchChan <- req
-	return <-req.errChan
+	err := <-req.errChan
+	if err != nil {
+		return nil, err
+	}
+	return req.result, nil
 }
 
 // Close drains pending writes, saves a snapshot, truncates the WAL, and
@@ -260,6 +398,8 @@ func (s *DiskStore) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.stopSnap)
 		<-s.snapDone
+		close(s.stopExp)
+		<-s.expDone
 
 		s.closeMu.Lock()
 		s.closed = true
@@ -276,4 +416,25 @@ func (s *DiskStore) Close() error {
 		}
 	})
 	return closeErr
+}
+
+// expireInterval is how often the active-expiration sweep runs.
+const expireInterval = time.Second
+
+// expireLoop actively drops expired keys in the background so memory does not
+// grow with dead entries between lazy-expiry hits.
+func (s *DiskStore) expireLoop() {
+	defer close(s.expDone)
+
+	ticker := time.NewTicker(expireInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.mem.SweepExpired()
+		case <-s.stopExp:
+			return
+		}
+	}
 }

@@ -107,7 +107,7 @@ func TestLeaderHelpers(t *testing.T) {
 
 func TestUnknownOpError(t *testing.T) {
 	n := NewNode("solo", nil, grantTransport{}, nil)
-	err := n.applyCmd(storage.Command{Op: 42})
+	_, err := n.applyCmd(storage.Command{Op: 42})
 	if err == nil || !strings.Contains(err.Error(), "unknown command op") {
 		t.Fatalf("expected unknown-op error, got %v", err)
 	}

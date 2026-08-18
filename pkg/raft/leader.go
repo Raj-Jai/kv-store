@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"log"
+	"time"
 
 	"github.com/Raj-Jai/kv-store/pkg/storage"
 )
@@ -77,6 +78,38 @@ func (n *Node) Clear() error {
 	return n.propose(storage.Command{Op: storage.OpClear})
 }
 
+// Incr atomically increments key and returns the new value once the entry is
+// applied. On a multi-node cluster this blocks until the entry is committed
+// and applied, so the returned value is linearizable.
+func (n *Node) Incr(key string) (int64, error) {
+	res, err := n.proposeWait(storage.Command{Op: storage.OpIncr, Key: key})
+	if err != nil {
+		return 0, err
+	}
+	return res.(int64), nil
+}
+
+// CAS swaps key to new when its value equals old and reports whether the swap
+// happened, once the entry is applied.
+func (n *Node) CAS(key, old, new string) (bool, error) {
+	res, err := n.proposeWait(storage.Command{Op: storage.OpCAS, Key: key, Old: old, Value: new})
+	if err != nil {
+		return false, err
+	}
+	return res.(bool), nil
+}
+
+// Expire sets an absolute expiry deadline for key once the entry is applied.
+func (n *Node) Expire(key string, expiresAt int64) error {
+	_, err := n.proposeWait(storage.Command{Op: storage.OpExpire, Key: key, ExpiresAt: expiresAt})
+	return err
+}
+
+// Scan pages over the local state machine.
+func (n *Node) Scan(cursor string, count int, pattern string) ([]storage.KeyValue, string, error) {
+	return n.store.Scan(cursor, count, pattern)
+}
+
 func (n *Node) Close() error {
 	n.Stop()
 	return n.store.Close()
@@ -106,7 +139,8 @@ func (n *Node) propose(cmd storage.Command) error {
 	}
 	if singleNode {
 		n.mu.Unlock()
-		return n.applyCmd(cmd)
+		_, err := n.applyCmd(cmd)
+		return err
 	}
 	peers := append([]string(nil), n.peers...)
 	n.mu.Unlock()
@@ -125,6 +159,63 @@ func (n *Node) propose(cmd storage.Command) error {
 		go n.replicateToPeer(peer)
 	}
 	return nil
+}
+
+// applyWaitTimeout bounds how long a state-dependent write (Incr/CAS/Expire)
+// waits for its entry to be committed and applied. A healthy cluster commits
+// in milliseconds; this only guards against a node that loses leadership or
+// stalls.
+const applyWaitTimeout = 5 * time.Second
+
+// proposeWait appends a command like propose, but additionally blocks until
+// the entry has been applied and returns the value its application produced.
+// For a single-node cluster the entry is applied inline. On a multi-node
+// cluster the waiter is registered before the entry can be committed, so no
+// apply is missed, and the caller learns the deterministic outcome of
+// Incr/CAS/Expire.
+func (n *Node) proposeWait(cmd storage.Command) (any, error) {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		addr := ""
+		if n.leaderID != nil {
+			addr = *n.leaderID
+		}
+		n.mu.Unlock()
+		return nil, &storage.NotLeaderError{LeaderAddr: addr}
+	}
+	n.log = append(n.log, Entry{Term: n.term, Cmd: cmd})
+	n.dirty = true
+	idx := n.lastLogIndex()
+	if len(n.peers) == 0 {
+		n.commitIndex = idx
+		res, err := n.applyCmd(cmd)
+		n.mu.Unlock()
+		return res, err
+	}
+	if n.applyTr == nil {
+		n.mu.Unlock()
+		return nil, errors.New("raft: apply loop not started")
+	}
+	wait := n.applyTr.WaitIndex(idx)
+	peers := append([]string(nil), n.peers...)
+	n.mu.Unlock()
+
+	if err := n.persist(); err != nil {
+		log.Printf("raft: persist log entry failed: %v", err)
+		return nil, errors.New("raft: could not persist log entry")
+	}
+	for _, peer := range peers {
+		go n.replicateToPeer(peer)
+	}
+
+	select {
+	case <-wait:
+		return n.applyTr.Result(idx)
+	case <-time.After(applyWaitTimeout):
+		return nil, errors.New("raft: entry not applied within timeout")
+	case <-n.stop:
+		return nil, errors.New("raft: node stopped")
+	}
 }
 
 // Term reports the node's current term.
@@ -243,17 +334,24 @@ func (n *Node) replicateToPeer(peer string) bool {
 	}
 }
 
-// applyCmd executes a single command against the local state machine. The
-// general commit-index apply loop is Developer B's M1.4 deliverable.
-func (n *Node) applyCmd(cmd storage.Command) error {
+// applyCmd executes a single command against the local state machine and
+// returns its outcome. The general commit-index apply loop is Developer B's
+// M1.4 deliverable.
+func (n *Node) applyCmd(cmd storage.Command) (any, error) {
 	switch cmd.Op {
 	case storage.OpPut:
-		return n.store.Put(cmd.Key, cmd.Value)
+		return nil, n.store.Put(cmd.Key, cmd.Value)
 	case storage.OpDelete:
-		return n.store.Delete(cmd.Key)
+		return nil, n.store.Delete(cmd.Key)
 	case storage.OpClear:
-		return n.store.Clear()
+		return nil, n.store.Clear()
+	case storage.OpIncr:
+		return n.store.Incr(cmd.Key)
+	case storage.OpCAS:
+		return n.store.CAS(cmd.Key, cmd.Old, cmd.Value)
+	case storage.OpExpire:
+		return nil, n.store.Expire(cmd.Key, cmd.ExpiresAt)
 	default:
-		return errors.New("raft: unknown command op")
+		return nil, errors.New("raft: unknown command op")
 	}
 }
