@@ -720,3 +720,44 @@ func TestDiskStoreSingleOpWalFailure(t *testing.T) {
 		t.Fatal("Expire succeeded with a closed WAL")
 	}
 }
+
+// TestIncrNonNumericThenCrashRestart guards against bricking the store: a
+// failed (non-numeric) Incr is WAL-logged before the memory apply, and replay
+// must re-evaluate it as a no-op rather than refusing to start. Close() masks
+// the bug by compacting and truncating the WAL, so a crash is simulated by
+// copying the data dir first.
+func TestIncrNonNumericThenCrashRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenDiskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Put("k", "txt")
+	if _, err := s.Incr("k"); err == nil {
+		t.Fatal("expected ErrNotNumeric")
+	}
+
+	crash := t.TempDir()
+	for _, name := range []string{"wal.log", "snapshot.dat"} {
+		src := filepath.Join(dir, name)
+		if _, err := os.Stat(src); err == nil {
+			data, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(crash, name), data, 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s.Close()
+
+	restored, err := OpenDiskStore(crash)
+	if err != nil {
+		t.Fatalf("crash-restart after failed Incr: %v", err)
+	}
+	defer restored.Close()
+	if v, _ := restored.Get("k"); v != "txt" {
+		t.Fatalf("Get = %q, want txt", v)
+	}
+}
