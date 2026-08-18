@@ -112,15 +112,34 @@ func (n *Node) propose(cmd storage.Command) error {
 	n.mu.Unlock()
 
 	// The leader's own copy of the entry must be durable before followers can
-	// be told about it.
+	// be told about it — and before the client is acked. On failure we return
+	// an error and skip replication: the entry stays in memory (and is saved
+	// by a later successful persist), but the client never got a durability
+	// promise it cannot keep.
 	if err := n.persist(); err != nil {
 		log.Printf("raft: persist log entry failed: %v", err)
+		return errors.New("raft: could not persist log entry")
 	}
 
 	for _, peer := range peers {
 		go n.replicateToPeer(peer)
 	}
 	return nil
+}
+
+// Term reports the node's current term.
+func (n *Node) Term() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.term
+}
+
+// LogEntry returns the entry at raft log index i for inspection (oracles,
+// tests). ok is false when the index is ahead of the log or compacted away.
+func (n *Node) LogEntry(i int) (Entry, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.entryAt(i)
 }
 
 // replicateToPeer sends any pending log entries (batched) to one follower as

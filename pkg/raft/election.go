@@ -80,9 +80,11 @@ func (n *Node) startElection() {
 	n.mu.Unlock()
 
 	// The new term and self-vote must be durable before any peer hears the
-	// RequestVote, otherwise a crash mid-election could vote twice.
+	// RequestVote, otherwise a crash mid-election could vote twice. If the
+	// state cannot be persisted we do not campaign at all.
 	if err := n.persist(); err != nil {
 		log.Printf("raft: persist election state failed: %v", err)
+		return
 	}
 
 	results := make(chan VoteResponse, len(peers))

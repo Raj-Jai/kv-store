@@ -58,8 +58,13 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 		n.resetElectionTimer()
 		resp := VoteResponse{Term: n.term, VoteGranted: true}
 		n.mu.Unlock()
+		// A vote only counts once it is durable: if it cannot be persisted we
+		// must not acknowledge it, or a crash right after the response could
+		// yield a second vote in the same term. The in-memory vote stays set,
+		// which is still safe for this process.
 		if err := n.persist(); err != nil {
 			log.Printf("raft: persist vote failed: %v", err)
+			return VoteResponse{Term: n.term, VoteGranted: false}
 		}
 		return resp
 	}
@@ -100,7 +105,8 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 		return resp
 	}
 
-	if n.mergeEntries(req) {
+	changed := n.mergeEntries(req)
+	if changed {
 		n.dirty = true
 	}
 	if req.LeaderCommit > n.commitIndex {
@@ -109,13 +115,20 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 		} else {
 			n.commitIndex = last
 		}
+		changed = true
 		n.dirty = true
 	}
 
 	resp := AppendEntriesResponse{Term: n.term, Success: true}
 	n.mu.Unlock()
-	if err := n.persist(); err != nil {
-		log.Printf("raft: persist log append failed: %v", err)
+	if changed {
+		// A log change only counts once it is durable: refuse the ack on
+		// persist failure so the leader retries (and re-persists) instead of
+		// believing the entries landed on disk.
+		if err := n.persist(); err != nil {
+			log.Printf("raft: persist log append failed: %v", err)
+			return AppendEntriesResponse{Term: n.term, Success: false}
+		}
 	}
 	return resp
 }

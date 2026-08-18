@@ -17,11 +17,11 @@ import (
 
 // RaftState is the durable subset of a node's raft state.
 type RaftState struct {
-	Term               int
-	VotedFor           *string
-	Log                []Entry
-	LastIncludedIndex  int
-	LastIncludedTerm   int
+	Term              int
+	VotedFor          *string
+	Log               []Entry
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }
 
 // RaftStore is the durability seam for raft state.

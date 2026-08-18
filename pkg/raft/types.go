@@ -104,8 +104,8 @@ type Node struct {
 	repl *replicationState
 
 	// Durability (M1.5) and compaction (M1.6).
-	raftStore        RaftStore
-	dirty            bool
+	raftStore         RaftStore
+	dirty             bool
 	lastIncludedIndex int
 	lastIncludedTerm  int
 
