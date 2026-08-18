@@ -1,0 +1,5 @@
+go test fuzz v1
+string("Ɍʿ腨؇鲗ױ淑ҝΔܝؒ㐎۲")
+string("0")
+string("0")
+[]byte("0")

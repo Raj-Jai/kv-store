@@ -1,0 +1,5 @@
+go test fuzz v1
+string("0")
+string("\xf2\x83\xa4\xf0\xbe\xbc\xf2\x83\xa4\xf0\xbe\xbc0\n")
+string("")
+[]byte("")

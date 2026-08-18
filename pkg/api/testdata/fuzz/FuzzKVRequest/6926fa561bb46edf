@@ -1,0 +1,5 @@
+go test fuzz v1
+string("PuT")
+string("/kv/8PPP8l\x8cY")
+string("7")
+[]byte("'")

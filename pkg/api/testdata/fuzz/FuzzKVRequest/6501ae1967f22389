@@ -1,0 +1,5 @@
+go test fuzz v1
+string("0000\xb7\xb7\xb7\xb7")
+string("0")
+string("")
+[]byte("")

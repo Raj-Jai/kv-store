@@ -1,0 +1,5 @@
+go test fuzz v1
+string("\u03a2\u0557\u074b\u05fb")
+string("0")
+string("0")
+[]byte("0")

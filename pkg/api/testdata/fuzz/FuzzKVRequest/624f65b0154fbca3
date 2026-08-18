@@ -1,0 +1,5 @@
+go test fuzz v1
+string("0")
+string("*")
+string("\x9aՖ\x8e0")
+[]byte("")

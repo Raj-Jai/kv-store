@@ -1,0 +1,5 @@
+go test fuzz v1
+string("0")
+string("aaaaaaa\x80")
+string("")
+[]byte("0")

@@ -1,0 +1,5 @@
+go test fuzz v1
+string("\x86\x8b\xde\xd000\xbb\x02\xae0\x80ں00\xcd0\x1a0\x0f\xb000\xbe\x1e0\xf7\xee00")
+string("0")
+string("0")
+[]byte("0")

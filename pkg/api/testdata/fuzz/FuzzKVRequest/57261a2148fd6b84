@@ -1,0 +1,5 @@
+go test fuzz v1
+string("\xef\x9c\xcf\xee\xaf\xe9")
+string("0")
+string("0")
+[]byte("0")

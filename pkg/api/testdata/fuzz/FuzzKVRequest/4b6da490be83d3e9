@@ -1,0 +1,5 @@
+go test fuzz v1
+string("GET")
+string("/kv/0A")
+string("")
+[]byte("0")

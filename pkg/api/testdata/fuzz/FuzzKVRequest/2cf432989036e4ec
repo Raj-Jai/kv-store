@@ -1,0 +1,5 @@
+go test fuzz v1
+string("ñ\xeb\x9cϷȮՍҍ\xe1\xa4ó\u061c\xf1\x9b\xe2\xbc\u07bf̧Ü֗֩ϙݔҞܤәӞ\xec\xa6\xe0\xac\xf0\x96ЯفĺǗ\xec\xa1\xe3\xb7ة0")
+string("0")
+string("0")
+[]byte("0")

@@ -1,0 +1,5 @@
+go test fuzz v1
+string("T72PS")
+string("/'Yy\xf9")
+string("")
+[]byte("1c S")
