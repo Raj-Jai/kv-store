@@ -63,3 +63,10 @@ func TestMemStoreConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestMemStoreCloseNoop(t *testing.T) {
+	s := NewMemStore()
+	if err := s.Close(); err != nil {
+		t.Fatalf("MemStore.Close = %v", err)
+	}
+}

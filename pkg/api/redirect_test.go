@@ -73,3 +73,24 @@ func TestDeleteRedirectsToLeader(t *testing.T) {
 		t.Fatalf("Location = %q, want %q", got, "http://leader:8081/kv/k")
 	}
 }
+
+func TestNewOpsRedirectToLeader(t *testing.T) {
+	s := NewServer(&notLeaderEngine{addr: "http://leader:8081"}, nil)
+
+	if rec := doRequest(t, s, http.MethodPost, "/kv/k/incr", ""); rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("incr = %d, want 307", rec.Code)
+	}
+	if rec := doRequest(t, s, http.MethodPut, "/kv/k/expire?ttl=1000", ""); rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expire = %d, want 307", rec.Code)
+	}
+	if rec := doRequest(t, s, http.MethodPut, "/kv/k/cas", `{"old":"a","new":"b"}`); rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("cas = %d, want 307", rec.Code)
+	}
+}
+
+func TestNewOpsNoLeaderReturns503(t *testing.T) {
+	s := NewServer(&notLeaderEngine{addr: ""}, nil)
+	if rec := doRequest(t, s, http.MethodPost, "/kv/k/incr", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("incr = %d, want 503", rec.Code)
+	}
+}

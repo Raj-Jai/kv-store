@@ -242,3 +242,24 @@ func TestCompactIfNeeded(t *testing.T) {
 		t.Fatal("expected error when WAL file is missing")
 	}
 }
+
+func TestSnapshotV1Migration(t *testing.T) {
+	dir := t.TempDir()
+	// Write a legacy (v1) snapshot: a raw map[string]string.
+	if err := atomicWriteFile(filepath.Join(dir, "snapshot.dat"), []byte(`{"a":"1","b":"2"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenDiskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if got, _ := s.Get("a"); got != "1" {
+		t.Fatalf("Get(a) = %q, want 1", got)
+	}
+	if got, _ := s.Get("b"); got != "2" {
+		t.Fatalf("Get(b) = %q, want 2", got)
+	}
+}

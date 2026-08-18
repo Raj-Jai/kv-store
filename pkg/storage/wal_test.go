@@ -132,3 +132,16 @@ func TestOpenDiskStoreRejectsCorruptSnapshot(t *testing.T) {
 		t.Fatal("expected error loading a corrupt snapshot")
 	}
 }
+
+func TestDiskStoreSize(t *testing.T) {
+	s, err := OpenDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.Put("a", "1")
+	s.Put("b", "2")
+	if s.Size() != 2 {
+		t.Fatalf("Size = %d, want 2", s.Size())
+	}
+}

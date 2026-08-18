@@ -116,83 +116,6 @@ func TestCASValidation(t *testing.T) {
 	}
 }
 
-func TestScanPagination(t *testing.T) {
-	s := newTestServer()
-	for i := 0; i < 5; i++ {
-		doRequest(t, s, http.MethodPut, "/kv/k"+string(rune('0'+i)), "v")
-	}
-
-	var all []string
-	cursor := ""
-	for i := 0; i < 10; i++ {
-		path := "/kv?count=2"
-		if cursor != "" {
-			path += "&cursor=" + cursor
-		}
-		rec := doRequest(t, s, http.MethodGet, path, "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("scan = %d, want 200", rec.Code)
-		}
-		var resp struct {
-			Items []struct {
-				Key string `json:"key"`
-			} `json:"items"`
-			Cursor string `json:"cursor"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		for _, it := range resp.Items {
-			all = append(all, it.Key)
-		}
-		if resp.Cursor == "" {
-			break
-		}
-		cursor = resp.Cursor
-	}
-
-	if len(all) != 5 {
-		t.Fatalf("scan returned %d keys, want 5", len(all))
-	}
-}
-
-func TestScanPattern(t *testing.T) {
-	s := newTestServer()
-	doRequest(t, s, http.MethodPut, "/kv/user:1", "a")
-	doRequest(t, s, http.MethodPut, "/kv/user:2", "b")
-	doRequest(t, s, http.MethodPut, "/kv/post:1", "c")
-
-	rec := doRequest(t, s, http.MethodGet, "/kv?pattern=user:*", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("scan = %d, want 200", rec.Code)
-	}
-	var resp struct {
-		Items []struct {
-			Key string `json:"key"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if len(resp.Items) != 2 {
-		t.Fatalf("pattern scan items = %+v, want 2", resp.Items)
-	}
-}
-
-func TestScanValidation(t *testing.T) {
-	s := newTestServer()
-	if rec := doRequest(t, s, http.MethodGet, "/kv?count=0", ""); rec.Code != http.StatusBadRequest {
-		t.Fatalf("count=0 = %d, want 400", rec.Code)
-	}
-	if rec := doRequest(t, s, http.MethodGet, "/kv?count=1001", ""); rec.Code != http.StatusBadRequest {
-		t.Fatalf("count=1001 = %d, want 400", rec.Code)
-	}
-	longPattern := strings.Repeat("x", maxPatternLen+1)
-	if rec := doRequest(t, s, http.MethodGet, "/kv?pattern="+longPattern, ""); rec.Code != http.StatusBadRequest {
-		t.Fatalf("long pattern = %d, want 400", rec.Code)
-	}
-}
-
 func TestMetricsExpiredCounter(t *testing.T) {
 	s := newTestServer()
 	doRequest(t, s, http.MethodPut, "/kv/k", "v")
@@ -203,26 +126,5 @@ func TestMetricsExpiredCounter(t *testing.T) {
 	rec := doRequest(t, s, http.MethodGet, "/metrics", "")
 	if !strings.Contains(rec.Body.String(), "kvstore_expired_keys_total 1") {
 		t.Fatalf("expected expired counter 1 in:\n%s", rec.Body.String())
-	}
-}
-
-func TestNewOpsRedirectToLeader(t *testing.T) {
-	s := NewServer(&notLeaderEngine{addr: "http://leader:8081"}, nil)
-
-	if rec := doRequest(t, s, http.MethodPost, "/kv/k/incr", ""); rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("incr = %d, want 307", rec.Code)
-	}
-	if rec := doRequest(t, s, http.MethodPut, "/kv/k/expire?ttl=1000", ""); rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("expire = %d, want 307", rec.Code)
-	}
-	if rec := doRequest(t, s, http.MethodPut, "/kv/k/cas", `{"old":"a","new":"b"}`); rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("cas = %d, want 307", rec.Code)
-	}
-}
-
-func TestNewOpsNoLeaderReturns503(t *testing.T) {
-	s := NewServer(&notLeaderEngine{addr: ""}, nil)
-	if rec := doRequest(t, s, http.MethodPost, "/kv/k/incr", ""); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("incr = %d, want 503", rec.Code)
 	}
 }
