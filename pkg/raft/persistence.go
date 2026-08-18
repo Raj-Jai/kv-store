@@ -2,8 +2,11 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+
+	"github.com/Raj-Jai/kv-store/pkg/storage"
 )
 
 // Raft state persistence — Developer A (M1.5). currentTerm, votedFor, the
@@ -85,6 +88,91 @@ func (s *fileRaftStore) Load() (RaftState, error) {
 	}
 	var st RaftState
 	if err := json.Unmarshal(data, &st); err != nil {
+		return RaftState{}, err
+	}
+	return st, nil
+}
+
+// raftEncryptedMagic prefixes an encrypted raft-state file. A plaintext file
+// begins with '{'.
+const raftEncryptedMagic byte = 0xE5
+
+// encryptedRaftStore persists raft state as a single sealed blob: a magic
+// byte followed by the AES-GCM ciphertext of the JSON. The raft log holds
+// every proposed user Command (key and value) until snapshot compaction, so
+// leaving it in plaintext would defeat at-rest encryption of the store.
+type encryptedRaftStore struct {
+	path string
+	enc  storage.Encryptor
+}
+
+// NewEncryptedFileRaftStore creates a RaftStore backed by the given file path,
+// sealing every write with enc. Loading a file that is not sealed (no magic
+// byte) is an error, so a keyed deployment can never silently downgrade to
+// plaintext.
+func NewEncryptedFileRaftStore(path string, enc storage.Encryptor) RaftStore {
+	return &encryptedRaftStore{path: path, enc: enc}
+}
+
+func (s *encryptedRaftStore) Save(state RaftState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	sealed, err := s.enc.Encrypt(data)
+	if err != nil {
+		return err
+	}
+	blob := make([]byte, 0, 1+len(sealed))
+	blob = append(blob, raftEncryptedMagic)
+	blob = append(blob, sealed...)
+
+	tmp := s.path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(blob); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func (s *encryptedRaftStore) Load() (RaftState, error) {
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return RaftState{}, nil
+	}
+	if err != nil {
+		return RaftState{}, err
+	}
+	if len(data) == 0 || data[0] != raftEncryptedMagic {
+		return RaftState{}, errors.New("raft state file is not encrypted; refusing to start under an encryption key")
+	}
+	plain, err := s.enc.Decrypt(data[1:])
+	if err != nil {
+		return RaftState{}, err
+	}
+	var st RaftState
+	if err := json.Unmarshal(plain, &st); err != nil {
 		return RaftState{}, err
 	}
 	return st, nil

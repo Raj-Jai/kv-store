@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -34,9 +35,16 @@ const maxRecordField = 1 << 20
 // WAL is an append-only log of mutations in the format
 // [opCode][keyLen][key][valLen][value]. An operation is durable once Sync
 // returns; Replay restores the logged state into memory.
+//
+// When opened with a cipher (OpenWALEncrypted), every record is sealed with
+// AES-256-GCM before it is written: the file starts with walEncryptedMagic,
+// then each record is [uint32 sealedLen][nonce||ciphertext||tag]. The framing
+// after the magic is per-record length-prefixed because the record bodies are
+// opaque ciphertext that the plaintext parser could not scan.
 type WAL struct {
-	path string
-	f    *os.File
+	path   string
+	f      *os.File
+	cipher *atRestCipher
 }
 
 // OpenWAL opens the log at path, creating it if it does not exist.
@@ -46,6 +54,43 @@ func OpenWAL(path string) (*WAL, error) {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
 	return &WAL{path: path, f: f}, nil
+}
+
+// OpenWALEncrypted opens (or creates) an at-rest encrypted log. A freshly
+// created file is stamped with walEncryptedMagic. An existing file must
+// already carry the magic, otherwise it was written without encryption and
+// opening it under a cipher would silently leave data at rest in plaintext.
+func OpenWALEncrypted(path string, c *atRestCipher) (*WAL, error) {
+	w, err := OpenWAL(path)
+	if err != nil {
+		return nil, err
+	}
+	st, err := w.f.Stat()
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("stat wal: %w", err)
+	}
+	if st.Size() == 0 {
+		if _, err := w.f.Write([]byte{walEncryptedMagic}); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("stamp encrypted wal: %w", err)
+		}
+		if err := w.f.Sync(); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("sync encrypted wal stamp: %w", err)
+		}
+		return &WAL{path: path, f: w.f, cipher: c}, nil
+	}
+	first := make([]byte, 1)
+	if _, err := w.f.ReadAt(first, 0); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("read wal header: %w", err)
+	}
+	if first[0] != walEncryptedMagic {
+		w.Close()
+		return nil, errors.New("existing wal is not encrypted; provide no key or re-encrypt the data directory")
+	}
+	return &WAL{path: path, f: w.f, cipher: c}, nil
 }
 
 func (w *WAL) AppendPut(key, value string) error {
@@ -105,6 +150,19 @@ func (w *WAL) AppendExpire(key string, expiresAt int64) error {
 }
 
 func (w *WAL) append(b []byte) error {
+	if w.cipher != nil {
+		sealed, err := w.cipher.Encrypt(b)
+		if err != nil {
+			return err
+		}
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(sealed)))
+		if _, err := w.f.Write(lenBuf[:]); err != nil {
+			return err
+		}
+		_, err = w.f.Write(sealed)
+		return err
+	}
 	_, err := w.f.Write(b)
 	return err
 }
@@ -120,13 +178,32 @@ func (w *WAL) Close() error {
 }
 
 // Truncate empties the log file. Callers must ensure no append is in flight.
+// An encrypted log re-stamps its magic header so the next record stays framed.
 func (w *WAL) Truncate() error {
-	return os.Truncate(w.path, 0)
+	if err := os.Truncate(w.path, 0); err != nil {
+		return err
+	}
+	if w.cipher != nil {
+		// After truncate the size is 0, so an O_APPEND write lands at offset 0,
+		// re-stamping the magic header that prefixes every sealed record.
+		if _, err := w.f.Write([]byte{walEncryptedMagic}); err != nil {
+			return err
+		}
+		return w.f.Sync()
+	}
+	return nil
 }
 
 // Replay reads every record in order and applies it to m, restoring the
 // state acknowledged before any crash.
 func (w *WAL) Replay(m *MemStore) error {
+	if w.cipher != nil {
+		return w.replayEncrypted(m)
+	}
+	return w.replayPlain(m)
+}
+
+func (w *WAL) replayPlain(m *MemStore) error {
 	f, err := os.Open(w.path)
 	if err != nil {
 		return fmt.Errorf("open wal for replay: %w", err)
@@ -150,86 +227,163 @@ func (w *WAL) Replay(m *MemStore) error {
 		}
 		remaining--
 
-		switch opCode(op) {
-		case opPut:
-			key, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal put key: %w", err)
-			}
-			remaining -= n
-			value, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal put value: %w", err)
-			}
-			remaining -= n
-			m.Put(key, value)
-		case opDelete:
-			key, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal delete key: %w", err)
-			}
-			remaining -= n
-			m.Delete(key)
-		case opClear:
-			m.Clear()
-		case opIncr:
-			key, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal incr key: %w", err)
-			}
-			remaining -= n
-			// Deterministic re-evaluation: an incr that failed at apply time
-			// (non-numeric value, or overflow at int64 max) changed no state,
-			// so replaying it is a no-op (mirrors the leniency applied to
-			// CAS/Expire below).
-			if _, err := m.Incr(key); err != nil && !errors.Is(err, ErrNotNumeric) && !errors.Is(err, ErrOverflow) {
-				return fmt.Errorf("replay wal incr: %w", err)
-			}
-		case opCAS:
-			key, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal cas key: %w", err)
-			}
-			remaining -= n
-			old, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal cas old: %w", err)
-			}
-			remaining -= n
-			new, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal cas new: %w", err)
-			}
-			remaining -= n
-			// Deterministic re-evaluation: a CAS whose key is absent is a
-			// no-op, exactly as it would have been at apply time.
-			if _, err := m.CAS(key, old, new); err != nil && !errors.Is(err, ErrNotFound) {
-				return fmt.Errorf("replay wal cas: %w", err)
-			}
-		case opExpire:
-			key, n, err := readString(r, remaining)
-			if err != nil {
-				return fmt.Errorf("read wal expire key: %w", err)
-			}
-			remaining -= n
-			if remaining < 8 {
-				return fmt.Errorf("read wal expire ts: %w", io.ErrUnexpectedEOF)
-			}
-			var tsBuf [8]byte
-			if _, err := io.ReadFull(r, tsBuf[:]); err != nil {
-				return fmt.Errorf("read wal expire ts: %w", err)
-			}
-			remaining -= 8
-			expiresAt := int64(binary.BigEndian.Uint64(tsBuf[:]))
-			// Deterministic re-evaluation: expiring an absent key is a no-op.
-			if err := m.Expire(key, expiresAt); err != nil && !errors.Is(err, ErrNotFound) {
-				return fmt.Errorf("replay wal expire: %w", err)
-			}
-		default:
-			return fmt.Errorf("corrupted wal: unknown op code %d", op)
+		consumed, err := applyRecord(op, r, remaining, m)
+		if err != nil {
+			return err
 		}
+		remaining -= consumed
 	}
 	return nil
+}
+
+// replayEncrypted reads the sealed records of an encrypted log, decrypting
+// each one before parsing it. A truncated tail record (a crash mid-append) is
+// skipped, matching the plaintext parser's tolerance of a partial record.
+func (w *WAL) replayEncrypted(m *MemStore) error {
+	f, err := os.Open(w.path)
+	if err != nil {
+		return fmt.Errorf("open encrypted wal for replay: %w", err)
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	magic, err := r.ReadByte()
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read encrypted wal header: %w", err)
+	}
+	if magic != walEncryptedMagic {
+		return errors.New("encrypted wal missing header magic")
+	}
+
+	for {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(r, lenBuf[:]); err == io.EOF {
+			return nil
+		} else if err != nil {
+			// A crash between the header and a record body leaves a trailing
+			// fragment; treat it as a truncated append and stop.
+			return nil
+		}
+		sealedLen := binary.BigEndian.Uint32(lenBuf[:])
+		if uint64(sealedLen) > maxRecordField*2+64 {
+			return fmt.Errorf("encrypted wal record exceeds bound: %d", sealedLen)
+		}
+		sealed := make([]byte, sealedLen)
+		if _, err := io.ReadFull(r, sealed); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("read encrypted wal record: %w", err)
+		}
+		plain, err := w.cipher.Decrypt(sealed)
+		if err != nil {
+			return fmt.Errorf("decrypt wal record: %w", err)
+		}
+		// A sealed blob is a self-contained stream of one or more records.
+		// Production appends seal exactly one record per blob; parsing a
+		// stream keeps replay correct and lets fuzzers feed arbitrary blobs.
+		br := bufio.NewReader(bytes.NewReader(plain))
+		remaining := int64(len(plain))
+		for remaining > 0 {
+			op, err := br.ReadByte()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("read decrypted wal record: %w", err)
+			}
+			remaining--
+			consumed, err := applyRecord(op, br, remaining, m)
+			if err != nil {
+				return err
+			}
+			remaining -= consumed
+		}
+	}
+}
+
+// applyRecord applies one log record whose op byte was already read. r is
+// positioned at the record's fields; remaining is how many field bytes exist
+// after the op byte. It returns the number of field bytes consumed.
+func applyRecord(op byte, r *bufio.Reader, remaining int64, m *MemStore) (int64, error) {
+	switch opCode(op) {
+	case opPut:
+		key, n1, err := readString(r, remaining)
+		if err != nil {
+			return 0, fmt.Errorf("read wal put key: %w", err)
+		}
+		value, n2, err := readString(r, remaining-n1)
+		if err != nil {
+			return 0, fmt.Errorf("read wal put value: %w", err)
+		}
+		m.Put(key, value)
+		return n1 + n2, nil
+	case opDelete:
+		key, n, err := readString(r, remaining)
+		if err != nil {
+			return 0, fmt.Errorf("read wal delete key: %w", err)
+		}
+		m.Delete(key)
+		return n, nil
+	case opClear:
+		m.Clear()
+		return 0, nil
+	case opIncr:
+		key, n, err := readString(r, remaining)
+		if err != nil {
+			return 0, fmt.Errorf("read wal incr key: %w", err)
+		}
+		// Deterministic re-evaluation: an incr that failed at apply time
+		// (non-numeric value, or overflow at int64 max) changed no state,
+		// so replaying it is a no-op (mirrors the leniency applied to
+		// CAS/Expire below).
+		if _, err := m.Incr(key); err != nil && !errors.Is(err, ErrNotNumeric) && !errors.Is(err, ErrOverflow) {
+			return 0, fmt.Errorf("replay wal incr: %w", err)
+		}
+		return n, nil
+	case opCAS:
+		key, n1, err := readString(r, remaining)
+		if err != nil {
+			return 0, fmt.Errorf("read wal cas key: %w", err)
+		}
+		old, n2, err := readString(r, remaining-n1)
+		if err != nil {
+			return 0, fmt.Errorf("read wal cas old: %w", err)
+		}
+		new, n3, err := readString(r, remaining-n1-n2)
+		if err != nil {
+			return 0, fmt.Errorf("read wal cas new: %w", err)
+		}
+		// Deterministic re-evaluation: a CAS whose key is absent is a
+		// no-op, exactly as it would have been at apply time.
+		if _, err := m.CAS(key, old, new); err != nil && !errors.Is(err, ErrNotFound) {
+			return 0, fmt.Errorf("replay wal cas: %w", err)
+		}
+		return n1 + n2 + n3, nil
+	case opExpire:
+		key, n1, err := readString(r, remaining)
+		if err != nil {
+			return 0, fmt.Errorf("read wal expire key: %w", err)
+		}
+		if remaining-n1 < 8 {
+			return 0, fmt.Errorf("read wal expire ts: %w", io.ErrUnexpectedEOF)
+		}
+		var tsBuf [8]byte
+		if _, err := io.ReadFull(r, tsBuf[:]); err != nil {
+			return 0, fmt.Errorf("read wal expire ts: %w", err)
+		}
+		expiresAt := int64(binary.BigEndian.Uint64(tsBuf[:]))
+		// Deterministic re-evaluation: expiring an absent key is a no-op.
+		if err := m.Expire(key, expiresAt); err != nil && !errors.Is(err, ErrNotFound) {
+			return 0, fmt.Errorf("replay wal expire: %w", err)
+		}
+		return n1 + 8, nil
+	default:
+		return 0, fmt.Errorf("corrupted wal: unknown op code %d", op)
+	}
 }
 
 // readString reads a BigEndian length-prefixed string. remaining is the number
@@ -263,6 +417,11 @@ type DiskStore struct {
 	mem *MemStore
 	wal *WAL
 
+	// cipher encrypts wal.log and snapshot.dat at rest when non-nil
+	// (ENCRYPTION_KEY / KEY_FILE). Snapshots shipped to raft peers over the
+	// network stay in the plaintext JSON format; only persistence is sealed.
+	cipher *atRestCipher
+
 	batchChan chan *batchRequest
 	batchDone chan struct{}
 	snapMu    sync.Mutex // serializes WAL append/apply against snapshot+truncate
@@ -282,11 +441,32 @@ type DiskStore struct {
 // OpenDiskStore creates a persistent store in dataDir, restoring any
 // previously acknowledged state by loading the snapshot and replaying the WAL.
 func OpenDiskStore(dataDir string) (*DiskStore, error) {
+	return openDiskStore(dataDir, nil)
+}
+
+// OpenDiskStoreWithKey is OpenDiskStore with AES-256-GCM encryption at rest
+// for wal.log and snapshot.dat. The key must be exactly 32 bytes; every file
+// in dataDir must have been written under the same key.
+func OpenDiskStoreWithKey(dataDir string, key []byte) (*DiskStore, error) {
+	c, err := newAtRestCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return openDiskStore(dataDir, c)
+}
+
+func openDiskStore(dataDir string, cipher *atRestCipher) (*DiskStore, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	wal, err := OpenWAL(filepath.Join(dataDir, "wal.log"))
+	var wal *WAL
+	var err error
+	if cipher != nil {
+		wal, err = OpenWALEncrypted(filepath.Join(dataDir, "wal.log"), cipher)
+	} else {
+		wal, err = OpenWAL(filepath.Join(dataDir, "wal.log"))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +474,7 @@ func OpenDiskStore(dataDir string) (*DiskStore, error) {
 	s := &DiskStore{
 		mem:          NewMemStore(),
 		wal:          wal,
+		cipher:       cipher,
 		walPath:      filepath.Join(dataDir, "wal.log"),
 		snapshotPath: filepath.Join(dataDir, "snapshot.dat"),
 		batchChan:    make(chan *batchRequest, 2*maxBatchSize),

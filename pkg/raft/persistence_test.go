@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -197,6 +198,110 @@ func TestFileStoreLoadMissingFileIsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st.Term != 0 || st.VotedFor != nil || len(st.Log) != 0 {
+		t.Fatalf("expected empty state, got %+v", st)
+	}
+}
+
+func newEncryptedStore(t *testing.T) (RaftStore, storage.Encryptor) {
+	t.Helper()
+	key := bytes.Repeat([]byte{0x5c}, storage.AtRestKeySize)
+	enc, err := storage.NewAtRestCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewEncryptedFileRaftStore(filepath.Join(t.TempDir(), "raftstate.json"), enc), enc
+}
+
+func TestEncryptedRaftStoreRoundTrip(t *testing.T) {
+	s, _ := newEncryptedStore(t)
+	votedFor := "c9"
+	want := RaftState{
+		Term:              11,
+		VotedFor:          &votedFor,
+		Log:               []Entry{{Term: 11, Cmd: storage.Command{Op: storage.OpPut, Key: "k", Value: "top-secret"}}},
+		LastIncludedIndex: 7,
+		LastIncludedTerm:  4,
+	}
+	if err := s.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	// The raw file must not contain any plaintext state (the value, the key,
+	// or JSON structure like "VotedFor").
+	raw, err := os.ReadFile(s.(*encryptedRaftStore).path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{"top-secret", "VotedFor", "LastIncludedIndex", "LastIncludedTerm"} {
+		if bytes.Contains(raw, []byte(needle)) {
+			t.Fatalf("raft state leaked in plaintext: %q present in file", needle)
+		}
+	}
+	got, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Term != 11 || got.VotedFor == nil || *got.VotedFor != "c9" {
+		t.Fatalf("round trip mismatch: %+v", got)
+	}
+	if len(got.Log) != 1 || got.Log[0].Cmd.Key != "k" || got.Log[0].Cmd.Value != "top-secret" {
+		t.Fatalf("log lost or corrupted: %+v", got.Log)
+	}
+}
+
+func TestEncryptedRaftStoreWrongKeyFails(t *testing.T) {
+	dir := t.TempDir()
+	key1 := bytes.Repeat([]byte{0x11}, storage.AtRestKeySize)
+	key2 := bytes.Repeat([]byte{0x22}, storage.AtRestKeySize)
+	enc1, _ := storage.NewAtRestCipher(key1)
+	enc2, _ := storage.NewAtRestCipher(key2)
+
+	s1 := NewEncryptedFileRaftStore(filepath.Join(dir, "state"), enc1)
+	if err := s1.Save(RaftState{Term: 3}); err != nil {
+		t.Fatal(err)
+	}
+	s2 := NewEncryptedFileRaftStore(filepath.Join(dir, "state"), enc2)
+	if _, err := s2.Load(); err == nil {
+		t.Fatal("expected wrong-key load to fail")
+	}
+}
+
+func TestEncryptedRaftStoreTamperDetected(t *testing.T) {
+	s, _ := newEncryptedStore(t)
+	if err := s.Save(RaftState{Term: 2}); err != nil {
+		t.Fatal(err)
+	}
+	path := s.(*encryptedRaftStore).path
+	raw, _ := os.ReadFile(path)
+	raw[len(raw)-1] ^= 0xFF
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(); err == nil {
+		t.Fatal("expected tampered file to fail load")
+	}
+}
+
+func TestEncryptedRaftStoreRefusesPlaintextFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state")
+	// A deployment that ran without a key leaves a plaintext raft-state file.
+	if err := os.WriteFile(path, []byte(`{"Term":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := newEncryptedStore(t)
+	s.(*encryptedRaftStore).path = path
+	if _, err := s.Load(); err == nil {
+		t.Fatal("expected keyed load to refuse a plaintext file")
+	}
+}
+
+func TestEncryptedRaftStoreLoadMissingFileIsEmpty(t *testing.T) {
+	s, _ := newEncryptedStore(t)
+	st, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Term != 0 || len(st.Log) != 0 {
 		t.Fatalf("expected empty state, got %+v", st)
 	}
 }

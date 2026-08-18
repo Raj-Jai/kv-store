@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -64,13 +65,26 @@ func (s *DiskStore) compact() error {
 	return s.compactLocked()
 }
 
-// saveSnapshot serializes memory state to snapshot.dat atomically.
+// saveSnapshot serializes memory state to snapshot.dat atomically. With a
+// cipher configured the JSON payload is sealed before writing: the file is
+// [snapshotMagic][nonce||ciphertext||tag], and a plaintext file is the raw
+// JSON (detected by snapshotMagic's absence).
 func (s *DiskStore) saveSnapshot() error {
 	s.mem.mu.RLock()
 	data, err := json.Marshal(snapshotFile{V: snapshotVersion, Data: s.mem.data})
 	s.mem.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
+	}
+	if s.cipher != nil {
+		sealed, err := s.cipher.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("encrypt snapshot: %w", err)
+		}
+		blob := make([]byte, 0, len(snapshotMagic)+len(sealed))
+		blob = append(blob, snapshotMagic...)
+		blob = append(blob, sealed...)
+		data = blob
 	}
 	return atomicWriteFile(s.snapshotPath, data, 0644)
 }
@@ -132,7 +146,8 @@ func (s *DiskStore) compactLocked() error {
 	return s.wal.Truncate()
 }
 
-// loadSnapshot replaces memory state with the contents of snapshot.dat.
+// loadSnapshot replaces memory state with the contents of snapshot.dat,
+// decrypting an at-rest sealed snapshot when a cipher is configured.
 func (s *DiskStore) loadSnapshot() error {
 	data, err := os.ReadFile(s.snapshotPath)
 	if err != nil {
@@ -140,6 +155,19 @@ func (s *DiskStore) loadSnapshot() error {
 			return nil
 		}
 		return fmt.Errorf("read snapshot: %w", err)
+	}
+	encrypted := len(data) >= len(snapshotMagic) && string(data[:len(snapshotMagic)]) == snapshotMagic
+	if encrypted && s.cipher == nil {
+		return errors.New("snapshot is encrypted at rest; provide ENCRYPTION_KEY or KEY_FILE")
+	}
+	if encrypted {
+		sealed := data[len(snapshotMagic):]
+		data, err = s.cipher.Decrypt(sealed)
+		if err != nil {
+			return fmt.Errorf("decrypt snapshot: %w", err)
+		}
+	} else if s.cipher != nil {
+		return errors.New("existing snapshot is not encrypted; provide no key or re-encrypt the data directory")
 	}
 	fresh := make(map[string]entry)
 	if err := decodeSnapshot(data, fresh); err != nil {
