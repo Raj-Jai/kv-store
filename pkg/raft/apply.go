@@ -130,20 +130,46 @@ func (n *Node) applyLoop(ctx context.Context, tr *ApplyTracker) {
 			time.Sleep(time.Millisecond)
 			continue
 		}
-		n.lastApplied++
-		idx := n.lastApplied
+		idx := n.lastApplied + 1
 		entry, ok := n.entryAt(idx)
+		n.mu.Unlock()
+
+		// A snapshot install and an entry apply both write the state machine.
+		// Holding applyMu around the store write (and taking n.mu to re-check
+		// under it) guarantees a restore can never interleave with an apply
+		// and resurrect an older value after the restore.
+		n.applyMu.Lock()
+		n.mu.Lock()
+		if n.lastApplied >= idx {
+			// A snapshot installed since idx was picked already covers it.
+			n.mu.Unlock()
+			n.applyMu.Unlock()
+			tr.applied(idx, applyResult{})
+			continue
+		}
 		n.mu.Unlock()
 
 		if !ok {
 			// Already compacted into a snapshot and applied from it.
+			n.mu.Lock()
+			if idx > n.lastApplied {
+				n.lastApplied = idx
+			}
+			n.mu.Unlock()
 			tr.applied(idx, applyResult{})
+			n.applyMu.Unlock()
 			continue
 		}
 		res, err := n.applyCmd(entry.Cmd)
 		if err != nil {
 			log.Printf("raft: apply entry %d failed: %v", idx, err)
 		}
+		n.mu.Lock()
+		if idx > n.lastApplied {
+			n.lastApplied = idx
+		}
+		n.mu.Unlock()
+		n.applyMu.Unlock()
 		tr.applied(idx, applyResult{val: res, err: err})
 	}
 }

@@ -86,6 +86,12 @@ type InstallSnapshotResponse struct {
 type Node struct {
 	mu sync.Mutex
 
+	// applyMu serializes state-machine writes: the apply loop's applyCmd and
+	// HandleInstallSnapshot's snapshot restore both write the store, and they
+	// must never interleave (a restore racing an in-flight apply can let the
+	// apply resurrect an older value after the restore).
+	applyMu sync.Mutex
+
 	id       string
 	peers    []string
 	role     Role

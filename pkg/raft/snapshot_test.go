@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -253,6 +254,146 @@ func TestHandleInstallSnapshotStaleSnapshotIgnored(t *testing.T) {
 	n.mu.Unlock()
 	if got := sink.got(); got != nil {
 		t.Fatalf("stale snapshot must not apply data, got %q", got)
+	}
+}
+
+// blockingEngine is a storage.Engine whose Put signals entry and then blocks
+// until release is closed, so a test can hold the apply loop mid-apply. It
+// also implements SnapshotSink: ApplySnapshot replaces the whole store, which
+// is what the storage side does on restore. putDone fires after a released
+// Put has actually written, and restores counts how many restores ran.
+type blockingEngine struct {
+	mu       sync.Mutex
+	kv       map[string]string
+	entered  chan struct{}
+	release  chan struct{}
+	putDone  chan struct{}
+	restores int
+}
+
+func newBlockingEngine() *blockingEngine {
+	return &blockingEngine{
+		kv:      map[string]string{},
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		putDone: make(chan struct{}, 1),
+	}
+}
+
+func (e *blockingEngine) Get(key string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	v, ok := e.kv[key]
+	if !ok {
+		return "", storage.ErrNotFound
+	}
+	return v, nil
+}
+
+func (e *blockingEngine) Put(key, value string) error {
+	select {
+	case e.entered <- struct{}{}:
+	default:
+	}
+	<-e.release
+	e.mu.Lock()
+	e.kv[key] = value
+	e.mu.Unlock()
+	select {
+	case e.putDone <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (e *blockingEngine) Delete(key string) error          { return nil }
+func (e *blockingEngine) Clear() error                     { return nil }
+func (e *blockingEngine) Close() error                     { return nil }
+func (e *blockingEngine) Incr(string) (int64, error)       { return 0, nil }
+func (e *blockingEngine) CAS(_, _, _ string) (bool, error) { return false, nil }
+func (e *blockingEngine) Expire(string, int64) error       { return nil }
+func (e *blockingEngine) Scan(string, int, string) ([]storage.KeyValue, string, error) {
+	return nil, "", nil
+}
+
+func (e *blockingEngine) ApplySnapshot(data []byte) error {
+	e.mu.Lock()
+	e.kv = map[string]string{"k": "from-snapshot"}
+	e.restores++
+	e.mu.Unlock()
+	return nil
+}
+
+func (e *blockingEngine) restoreCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.restores
+}
+
+// TestApplyLoopSnapshotRestoreNeverInterleaves reproduces the interleaving
+// that rolled acked writes back: the apply loop picks entry 1 and blocks
+// inside Put while a snapshot covering entry 1 arrives. The restore must be
+// serialized against the in-flight apply; otherwise the restore sets the store
+// to the snapshot state and the just-released Put then resurrects the older
+// value ("v1"), which a reader observes as a rolled-back write.
+func TestApplyLoopSnapshotRestoreNeverInterleaves(t *testing.T) {
+	eng := newBlockingEngine()
+	n := NewNode("a", []string{"p1"}, FakeTransport{}, eng)
+	n.SetSnapshotSink(eng)
+	n.mu.Lock()
+	n.term = 1
+	n.log = []Entry{
+		{Term: 1, Cmd: storage.Command{Op: storage.OpPut, Key: "k", Value: "v1"}},
+		{Term: 1, Cmd: storage.Command{Op: storage.OpPut, Key: "k", Value: "v2"}},
+	}
+	n.commitIndex = 2
+	n.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n.StartApply(ctx)
+
+	// The apply loop has picked entry 1 and is blocked in Put, holding
+	// applyMu. A snapshot covering entries 1-2 now arrives.
+	<-eng.entered
+	done := make(chan InstallSnapshotResponse, 1)
+	go func() {
+		done <- n.HandleInstallSnapshot(InstallSnapshotRequest{
+			Term:              2,
+			LeaderID:          "L",
+			LastIncludedIndex: 2,
+			LastIncludedTerm:  1,
+			Data:              []byte("state-at-2"),
+		})
+	}()
+
+	// With the serialization the restore is excluded against the in-flight
+	// apply, so it cannot run while Put is blocked. Without it, the restore
+	// runs immediately. Poll for the restore so that, on a pre-fix build, the
+	// restore is guaranteed to have landed before the apply's Put is released
+	// (which would then resurrect the older value). On the fixed build nothing
+	// fires in this window, so we release the apply and let the restore run
+	// after it.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && eng.restoreCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	close(eng.release) // let the in-flight apply finish
+	<-eng.putDone      // its write has landed
+
+	select {
+	case resp := <-done:
+		if !resp.Success {
+			t.Fatal("expected snapshot accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot handler did not return")
+	}
+
+	// The restore must be the final writer: the in-flight apply's older value
+	// must never win after a restore.
+	if got, _ := eng.Get("k"); got != "from-snapshot" {
+		t.Fatalf("store rolled back to %q after snapshot restore", got)
 	}
 }
 

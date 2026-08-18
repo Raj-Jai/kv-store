@@ -182,9 +182,13 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	n.mu.Unlock()
 
 	if installed && n.snapshotSink != nil {
+		// applyMu excludes the apply loop so the restore can never interleave
+		// with an entry apply (which would resurrect an older value).
+		n.applyMu.Lock()
 		if err := n.snapshotSink.ApplySnapshot(data); err != nil {
 			log.Printf("raft: apply snapshot data failed: %v", err)
 		}
+		n.applyMu.Unlock()
 	}
 	// Persist the new compaction base AFTER the snapshot data is durable: a
 	// crash in between leaves the old (lower) base with a state machine that
