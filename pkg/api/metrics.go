@@ -56,7 +56,7 @@ func (m *Metrics) TotalKeys() int64 { return m.totalKeys.Load() }
 
 // handleMetrics serves the metrics in Prometheus text format.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	s.metrics.render(w, s.keyCount())
+	s.metrics.render(w, s.keyCount(), s.expiredCount())
 }
 
 // keyCount prefers the engine's Size() when available, falling back to the
@@ -68,7 +68,16 @@ func (s *Server) keyCount() int64 {
 	return s.metrics.TotalKeys()
 }
 
-func (m *Metrics) render(w http.ResponseWriter, keyCount int64) {
+// expiredCount reports how many keys the engine has dropped by expiry, when
+// it exposes that counter.
+func (s *Server) expiredCount() uint64 {
+	if eng, ok := s.engine.(interface{ ExpiredCount() uint64 }); ok {
+		return eng.ExpiredCount()
+	}
+	return 0
+}
+
+func (m *Metrics) render(w http.ResponseWriter, keyCount int64, expiredCount uint64) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
 	fmt.Fprintln(w, "# HELP kvstore_requests_total Total number of HTTP requests.")
@@ -97,6 +106,10 @@ func (m *Metrics) render(w http.ResponseWriter, keyCount int64) {
 	fmt.Fprintln(w, "# HELP kvstore_keys_total Number of keys in the store.")
 	fmt.Fprintln(w, "# TYPE kvstore_keys_total gauge")
 	fmt.Fprintf(w, "kvstore_keys_total %d\n", keyCount)
+
+	fmt.Fprintln(w, "# HELP kvstore_expired_keys_total Number of keys dropped by expiry.")
+	fmt.Fprintln(w, "# TYPE kvstore_expired_keys_total counter")
+	fmt.Fprintf(w, "kvstore_expired_keys_total %d\n", expiredCount)
 
 	fmt.Fprintln(w, "# HELP kvstore_uptime_seconds Server uptime.")
 	fmt.Fprintln(w, "# TYPE kvstore_uptime_seconds gauge")

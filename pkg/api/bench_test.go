@@ -55,3 +55,53 @@ func BenchmarkHandlerDelete(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkHandlerIncr(b *testing.B) {
+	s := newTestServer()
+	if err := s.engine.Put("key", "1"); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/kv/key/incr", nil)
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d, want 200", rec.Code)
+		}
+	}
+}
+
+func BenchmarkHandlerCas(b *testing.B) {
+	s := newTestServer()
+	if err := s.engine.Put("key", "a"); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/kv/key/cas", strings.NewReader(`{"old":"a","new":"b"}`))
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d, want 200", rec.Code)
+		}
+	}
+}
+
+func BenchmarkHandlerScan(b *testing.B) {
+	s := newTestServer()
+	for i := 0; i < 100; i++ {
+		if err := s.engine.Put("key"+string(rune('a'+i%26)), "value"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/kv?count=100", nil)
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d, want 200", rec.Code)
+		}
+	}
+}

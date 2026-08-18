@@ -22,6 +22,18 @@ func (e *notLeaderEngine) Delete(key string) error {
 }
 func (e *notLeaderEngine) Clear() error { return nil }
 func (e *notLeaderEngine) Close() error { return nil }
+func (e *notLeaderEngine) Incr(key string) (int64, error) {
+	return 0, &storage.NotLeaderError{LeaderAddr: e.addr}
+}
+func (e *notLeaderEngine) CAS(key, old, new string) (bool, error) {
+	return false, &storage.NotLeaderError{LeaderAddr: e.addr}
+}
+func (e *notLeaderEngine) Expire(key string, expiresAt int64) error {
+	return &storage.NotLeaderError{LeaderAddr: e.addr}
+}
+func (e *notLeaderEngine) Scan(cursor string, count int, pattern string) ([]storage.KeyValue, string, error) {
+	return nil, "", nil
+}
 
 func TestPutRedirectsToLeader(t *testing.T) {
 	s := NewServer(&notLeaderEngine{addr: "http://leader:8081"}, nil)

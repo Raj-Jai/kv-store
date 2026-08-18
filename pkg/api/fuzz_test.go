@@ -45,6 +45,19 @@ func FuzzKVRequest(f *testing.F) {
 	f.Add("PUT", "/kv/empty", "", []byte(nil))
 	f.Add("GET", "/kv/a?q=1", "", []byte(nil))
 	f.Add("GET", "/kv/%FF%FE", "", []byte(nil))
+	// Phase 4 routes: expire, incr, cas, scan.
+	f.Add("PUT", "/kv/a/expire?ttl=1000", "", []byte(nil))
+	f.Add("PUT", "/kv/a/expire?ttl=-1", "", []byte(nil))
+	f.Add("PUT", "/kv/a/expire?ttl=abc", "", []byte(nil))
+	f.Add("POST", "/kv/a/incr", "", []byte(nil))
+	f.Add("POST", "/kv/txt/incr", "", []byte(nil))
+	f.Add("PUT", "/kv/a/cas", "", []byte(`{"old":"1","new":"2"}`))
+	f.Add("PUT", "/kv/a/cas", "", []byte(`{"old":`))
+	f.Add("GET", "/kv?count=1", "", []byte(nil))
+	f.Add("GET", "/kv?count=0", "", []byte(nil))
+	f.Add("GET", "/kv?count=abc", "", []byte(nil))
+	f.Add("GET", "/kv?cursor=abc&count=100&pattern=user:*", "", []byte(nil))
+	f.Add("GET", "/kv?pattern="+strings.Repeat("x", maxPatternLen+1), "", []byte(nil))
 
 	s := newTestServer()
 	f.Fuzz(func(t *testing.T, method, path, contentLength string, body []byte) {

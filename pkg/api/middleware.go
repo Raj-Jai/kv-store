@@ -11,7 +11,9 @@ const (
 	maxBodyBytes = 1 << 20
 )
 
-var keyPattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
+// keyPattern allows alphanumeric keys plus ':' so namespaced keys like
+// "user:1" can be paged with Scan patterns.
+var keyPattern = regexp.MustCompile(`^[a-zA-Z0-9:]+$`)
 
 // responseWriter captures the status code for request logging.
 type responseWriter struct {
@@ -89,7 +91,7 @@ func (s *Server) recoverPanic(next http.Handler) http.Handler {
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, DELETE, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Max-Age", "600")
 
