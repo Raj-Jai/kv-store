@@ -1,27 +1,45 @@
 package chaos
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 )
 
 // Fault matrix — Phase 2 gate. Each scenario runs the 5-node cluster under a
-// single fault kind with a fixed seed and asserts every invariant holds after
-// the fault heals. The seeded RNG makes each scenario reproducible.
+// single fault kind and asserts every invariant holds after the fault heals.
+// The seeded RNG makes each scenario reproducible: the default fixed seed is
+// used by CI, and CHAOS_SEED overrides it so a nightly randomized run can pick
+// any seed (Phase 3).
 const (
-	seed     uint64 = 42
-	startUp         = 1 * time.Second
-	baseline        = 400 * time.Millisecond
-	active          = 1200 * time.Millisecond
-	settle          = 1200 * time.Millisecond
-	every           = 100 * time.Millisecond
+	startUp  = 1 * time.Second
+	baseline = 400 * time.Millisecond
+	active   = 1200 * time.Millisecond
+	settle   = 1200 * time.Millisecond
+	every    = 100 * time.Millisecond
 )
+
+// gateSeed returns the RNG seed for the fault matrix: CHAOS_SEED if set
+// (parsed as uint64), otherwise the default fixed seed.
+func gateSeed() uint64 {
+	const def = 42
+	if s := os.Getenv("CHAOS_SEED"); s != "" {
+		v, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CHAOS_SEED %q: %v", s, err))
+		}
+		return v
+	}
+	return def
+}
 
 // runScenario starts a fresh cluster, lets it elect a leader, runs the
 // workload while the fault is active, then heals and asserts invariants.
 func runScenario(t *testing.T, f Fault) {
 	t.Helper()
-	c := NewCluster(t, 5, seed)
+	c := NewCluster(t, 5, gateSeed())
 	c.StartAll(startUp)
 
 	c.Run([]Fault{f}, baseline+active, settle, every)
@@ -37,7 +55,7 @@ func TestFaultCrashFollower(t *testing.T) {
 }
 
 func TestFaultCrashMultiple(t *testing.T) {
-	c := NewCluster(t, 5, seed)
+	c := NewCluster(t, 5, gateSeed())
 	c.StartAll(startUp)
 	// Crash two nodes at once; quorum (3 of 5) still holds.
 	c.Run([]Fault{
@@ -48,7 +66,7 @@ func TestFaultCrashMultiple(t *testing.T) {
 }
 
 func TestFaultCrashQuorum(t *testing.T) {
-	c := NewCluster(t, 5, seed)
+	c := NewCluster(t, 5, gateSeed())
 	c.StartAll(startUp)
 	// Crash three nodes: quorum is lost. When they return, the survivors must
 	// re-elect and durability of previously acked writes must hold.
@@ -104,7 +122,7 @@ func TestFaultFsError(t *testing.T) {
 // fixed seed, exercising the shared seeded RNG across faults and the oracle
 // set over a combined failure window (Developer B).
 func TestFaultMultiFaultSchedule(t *testing.T) {
-	c := NewCluster(t, 5, seed)
+	c := NewCluster(t, 5, gateSeed())
 	c.StartAll(startUp)
 	c.Run([]Fault{
 		{Kind: FaultPacketLoss, Rate: 0.2, At: baseline, For: active},
