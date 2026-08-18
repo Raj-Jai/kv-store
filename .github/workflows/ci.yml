@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+
+  test:
+    name: test -race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+
+  chaos:
+    name: chaos fixed seed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Phase 2 gate: the full fault matrix under the fixed seed (42). The
+      # nightly workflow re-runs this with random CHAOS_SEED values.
+      - name: Run the fixed-seed fault matrix
+        run: CHAOS_SEED=42 go test -race ./pkg/chaos/ -count=1
+
+  coverage:
+    name: coverage >= 80%
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Enforce per-package coverage gate
+        run: bash scripts/check_coverage.sh
+
+  fuzz:
+    name: fuzz (short)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fuzz the HTTP handler stack
+        run: go test -fuzz=FuzzKVRequest -fuzztime=20s ./pkg/api/
+
+  bench:
+    name: benchmark regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Compare this run's benchmarks against the previous run's on the same
+      # runner type (the committed benchmarks/api.txt is a human reference only;
+      # absolute ns/op are not comparable across CPUs).
+      - name: Restore previous benchmark output
+        id: bench-old
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-old.txt
+          key: bench-${{ runner.os }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            bench-${{ runner.os }}-${{ github.ref }}-
+      - name: Run benchmarks
+        run: go test -bench=. -run=^$ -benchtime=1000x -count=6 ./pkg/api/ > bench-new.txt
+      - name: Compare against previous run
+        if: hashFiles('bench-old.txt') != ''
+        run: |
+          go run golang.org/x/perf/cmd/benchstat@latest bench-old.txt bench-new.txt | tee benchstat.txt
+          # Fail on a statistically significant regression > 25%.
+          regressions=$(grep -oP '\+\d+(\.\d+)?%' benchstat.txt | sed 's/[+%]//g' | awk '$1 > 25 { print }')
+          if [[ -n "${regressions}" ]]; then
+            echo "Benchmark regression(s):"
+            echo "${regressions}"
+            exit 1
+          fi
+      - name: Save current output as next baseline
+        uses: actions/cache/save@v4
+        with:
+          path: bench-new.txt
+          key: bench-${{ runner.os }}-${{ github.ref }}-${{ github.run_id }}

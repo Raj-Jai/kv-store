@@ -1,0 +1,62 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  chaos-random-seeds:
+    name: chaos random seeds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The full fault matrix under several random seeds. Each seed is printed
+      # before its run so a failure identifies the exact seed for repro.
+      - name: Run the fault matrix under random seeds
+        run: |
+          set -e
+          for i in 1 2 3; do
+            s=$RANDOM$RANDOM
+            echo "== chaos seed: ${s} =="
+            CHAOS_SEED=${s} go test -race ./pkg/chaos/ -count=1
+          done
+
+  fuzz-long:
+    name: fuzz (5m)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Long fuzz of the HTTP handler stack
+        run: go test -fuzz=FuzzKVRequest -fuzztime=5m ./pkg/api/
+
+  report:
+    name: report failures
+    runs-on: ubuntu-latest
+    needs: [chaos-random-seeds, fuzz-long]
+    if: always()
+    steps:
+      - name: Open an issue on any nightly failure
+        if: needs.chaos-random-seeds.result == 'failure' || needs.fuzz-long.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const day = new Date().toISOString().slice(0, 10);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `nightly chaos/fuzz failure (${day})`,
+              body: `Nightly randomized chaos or long fuzz run failed on ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}. Working agreement: investigate and open a bug; never a silent fix.`,
+            });
