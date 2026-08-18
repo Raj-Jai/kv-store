@@ -175,13 +175,17 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	resp := InstallSnapshotResponse{Term: n.term, Success: true}
 	n.mu.Unlock()
 
-	if err := n.persist(); err != nil {
-		log.Printf("raft: persist snapshot failed: %v", err)
-	}
 	if installed && n.snapshotSink != nil {
 		if err := n.snapshotSink.ApplySnapshot(data); err != nil {
 			log.Printf("raft: apply snapshot data failed: %v", err)
 		}
+	}
+	// Persist the new compaction base AFTER the snapshot data is durable: a
+	// crash in between leaves the old (lower) base with a state machine that
+	// already includes the snapshot, which recovers idempotently. Persisting
+	// first would let a crash discard every entry up to the base.
+	if err := n.persist(); err != nil {
+		log.Printf("raft: persist snapshot failed: %v", err)
 	}
 	return resp
 }

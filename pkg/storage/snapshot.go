@@ -51,11 +51,7 @@ func (s *DiskStore) compactIfNeeded() error {
 func (s *DiskStore) compact() error {
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
-
-	if err := s.saveSnapshot(); err != nil {
-		return err
-	}
-	return s.wal.Truncate()
+	return s.compactLocked()
 }
 
 // saveSnapshot serializes memory state to snapshot.dat atomically.
@@ -67,6 +63,59 @@ func (s *DiskStore) saveSnapshot() error {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 	return atomicWriteFile(s.snapshotPath, data, 0644)
+}
+
+// SerializeSnapshot returns the current memory state in the on-disk snapshot
+// format, for shipping to a lagging raft peer (Developer B, M1.6). It is
+// safe to call concurrently with the periodic compaction loop.
+func (s *DiskStore) SerializeSnapshot() ([]byte, error) {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+
+	s.mem.mu.RLock()
+	defer s.mem.mu.RUnlock()
+	data, err := json.Marshal(s.mem.data)
+	if err != nil {
+		return nil, fmt.Errorf("marshal snapshot: %w", err)
+	}
+	return data, nil
+}
+
+// RestoreSnapshot replaces memory state with a snapshot received from a raft
+// leader and persists it as snapshot.dat, so the installed state survives a
+// crash even if the raft log base was not yet recorded (Developer B, M1.6).
+func (s *DiskStore) RestoreSnapshot(data []byte) error {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+
+	s.mem.mu.Lock()
+	if err := json.Unmarshal(data, &s.mem.data); err != nil {
+		s.mem.mu.Unlock()
+		return fmt.Errorf("unmarshal snapshot: %w", err)
+	}
+	s.mem.mu.Unlock()
+
+	if err := s.saveSnapshot(); err != nil {
+		return err
+	}
+	return s.wal.Truncate()
+}
+
+// Compact forces a compaction now: the current memory state is written to
+// snapshot.dat and the WAL is emptied. Call it after a raft log compaction
+// has been triggered, before the raft log base is advanced, so a crash in
+// between leaves a recoverable (idempotent) prefix (Developer B, M1.6).
+func (s *DiskStore) Compact() error {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	return s.compactLocked()
+}
+
+func (s *DiskStore) compactLocked() error {
+	if err := s.saveSnapshot(); err != nil {
+		return err
+	}
+	return s.wal.Truncate()
 }
 
 // loadSnapshot replaces memory state with the contents of snapshot.dat.

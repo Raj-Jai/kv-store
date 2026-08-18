@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,11 @@ import (
 const (
 	defaultPort    = "8081"
 	defaultDataDir = "./data"
+
+	// snapshotCompactThreshold is how many applied log entries may accumulate
+	// before the compactor folds them into a storage snapshot.
+	snapshotCompactThreshold  = 1000
+	snapshotCompactorInterval = 5 * time.Second
 )
 
 func envOr(key, fallback string) string {
@@ -50,8 +56,20 @@ func main() {
 		nodeID := envOr("NODE_ID", "http://127.0.0.1:"+port)
 		peers := strings.Split(peersRaw, ",")
 		node = raft.NewNode(nodeID, peers, &raft.HTTPTransport{}, store)
+
+		// Durable raft state (M1.5): term, votes and log survive restarts.
+		if err := node.SetRaftStore(raft.NewFileRaftStore(filepath.Join(dataDir, "raft-state.json"))); err != nil {
+			logger.Error("failed to wire raft state store", map[string]any{"error": err.Error()})
+		}
+		// Storage <-> raft snapshot bridge (M1.6): resync lagging followers
+		// and compact the log once it grows past the threshold.
+		bridge := &snapshotBridge{node: node, store: store}
+		node.SetSnapshotter(bridge)
+		node.SetSnapshotSink(bridge)
+
 		go node.Loop(ctx)
 		node.StartApply(ctx)
+		startSnapshotCompactor(ctx, bridge, logger, snapshotCompactThreshold)
 		engine = node
 	}
 

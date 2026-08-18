@@ -49,6 +49,30 @@ func (n *Node) ApplyIndex() int {
 	return n.lastApplied
 }
 
+// SnapshotBase reports the compaction base: the raft log index of the last
+// entry folded into a snapshot (0 when nothing has been compacted).
+func (n *Node) SnapshotBase() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastIncludedIndex
+}
+
+// LogTerm reports the term of the entry at raft index i, falling back to the
+// compaction base's term for indexes at or below the base. Returns -1 when
+// the index is unknown (ahead of the log).
+func (n *Node) LogTerm(i int) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.logTermAt(i)
+}
+
+// Flush forces any pending durable raft state — including a compaction base
+// recorded by CompactLog — to be written now. Call it after CompactLog so a
+// crash never leaves the base only in memory.
+func (n *Node) Flush() error {
+	return n.persist()
+}
+
 // StartApply launches the apply loop as a single goroutine and returns a
 // tracker for callers that want to block until a specific index is applied.
 // The loop ends when ctx is cancelled or the node is stopped.
