@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -441,6 +442,11 @@ func (c *Cluster) AssertInvariants() {
 	}
 	if len(errs) == 0 {
 		return
+	}
+	if os.Getenv("CHAOS_DEBUG") != "" {
+		for _, o := range c.hist.snapshot() {
+			c.t.Logf("op kind=%s seq=%d reader=%s acked=%v start=%d end=%d", o.kind, o.seq, o.readOn, o.acked, o.start.UnixNano(), o.end.UnixNano())
+		}
 	}
 	for _, err := range errs {
 		c.t.Errorf("invariant violated: %v", err)

@@ -14,7 +14,7 @@ import (
 // used by CI, and CHAOS_SEED overrides it so a nightly randomized run can pick
 // any seed (Phase 3).
 const (
-	startUp  = 1 * time.Second
+	startUp  = 2 * time.Second
 	baseline = 400 * time.Millisecond
 	active   = 1200 * time.Millisecond
 	settle   = 1200 * time.Millisecond

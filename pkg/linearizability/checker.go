@@ -53,6 +53,8 @@ func Check(ops []Op) []error {
 		}
 	}
 	maxSeen := map[string]uint64{}
+	maxSeenAt := map[string]int64{}
+	timeline := map[string][]Op{}
 	for _, o := range ops {
 		if o.Kind != Read || o.Seq == 0 {
 			continue
@@ -61,11 +63,13 @@ func Check(ops []Op) []error {
 			errs = append(errs, fmt.Errorf("reader %q observed seq %d at %d before its write began at %d", o.Reader, o.Seq, o.End, w.Start))
 		}
 		if prev, ok := maxSeen[o.Reader]; ok && o.Seq < prev {
-			errs = append(errs, fmt.Errorf("reader %q observed seq %d after seq %d", o.Reader, o.Seq, prev))
+			errs = append(errs, fmt.Errorf("reader %q observed seq %d at %d after seq %d at %d (reads so far: %v)", o.Reader, o.Seq, o.End, prev, maxSeenAt[o.Reader], timeline[o.Reader]))
 		}
 		if o.Seq > maxSeen[o.Reader] {
 			maxSeen[o.Reader] = o.Seq
+			maxSeenAt[o.Reader] = o.End
 		}
+		timeline[o.Reader] = append(timeline[o.Reader], o)
 	}
 	return errs
 }
