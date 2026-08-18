@@ -41,6 +41,8 @@ jobs:
           cache: true
       - name: Long fuzz of the HTTP handler stack
         run: go test -fuzz=FuzzKVRequest -fuzztime=5m ./pkg/api/
+      - name: Long fuzz of the WAL binary format
+        run: go test -fuzz=FuzzWALReplay -fuzztime=5m ./pkg/storage/
 
   report:
     name: report failures

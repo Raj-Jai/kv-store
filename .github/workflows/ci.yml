@@ -73,6 +73,8 @@ jobs:
           cache: true
       - name: Fuzz the HTTP handler stack
         run: go test -fuzz=FuzzKVRequest -fuzztime=20s ./pkg/api/
+      - name: Fuzz the WAL binary format
+        run: go test -fuzz=FuzzWALReplay -fuzztime=20s ./pkg/storage/
 
   bench:
     name: benchmark regression
