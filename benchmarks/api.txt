@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Raj-Jai/kv-store/pkg/api
+cpu: 12th Gen Intel(R) Core(TM) i7-1255U
+BenchmarkHandlerPut-12       	    1000	     32605 ns/op	   13103 B/op	     131 allocs/op
+BenchmarkHandlerGet-12       	    1000	     28502 ns/op	   11680 B/op	     119 allocs/op
+BenchmarkHandlerDelete-12    	    1000	     23057 ns/op	   11583 B/op	     116 allocs/op
+PASS
+ok  	github.com/Raj-Jai/kv-store/pkg/api	0.105s
