@@ -2,6 +2,7 @@ package chaos
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/Raj-Jai/kv-store/pkg/linearizability"
 )
@@ -121,14 +122,15 @@ func (stateMachineSafetyOracle) Check(c *Cluster) []error {
 	return errs
 }
 
-// durabilityOracle: every acked write (replicated + applied on a majority)
-// must be readable on every started node after the run has healed.
+// durabilityOracle: every acked write (committed on a cluster quorum) must be
+// readable on every started node after the run has healed. Raft guarantees
+// committed writes are applied "eventually", so the oracle polls for a short
+// healing window before declaring a violation.
 type durabilityOracle struct{}
 
 func (durabilityOracle) Name() string { return "durability" }
 
 func (durabilityOracle) Check(c *Cluster) []error {
-	var errs []error
 	acked := map[uint64]string{} // seq -> value
 	for _, o := range c.hist.snapshot() {
 		if o.kind == "write" && o.acked {
@@ -136,27 +138,38 @@ func (durabilityOracle) Check(c *Cluster) []error {
 		}
 	}
 	nodes := c.startedNodes()
-	for seq, value := range acked {
-		for id, n := range nodes {
-			v, err := n.Get("k")
-			if err != nil {
-				errs = append(errs, fmt.Errorf("acked write %s (seq %d) unreadable on %s: %v", value, seq, id, err))
-				continue
-			}
-			if readSeq(v) < seq {
-				errs = append(errs, fmt.Errorf("acked write %s (seq %d) rolled back to %s on %s", value, seq, v, id))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var errs []error
+		for seq, value := range acked {
+			for id, n := range nodes {
+				v, err := n.Get("k")
+				if err != nil {
+					errs = append(errs, fmt.Errorf("acked write %s (seq %d) unreadable on %s: %v", value, seq, id, err))
+					continue
+				}
+				if readSeq(v) < seq {
+					errs = append(errs, fmt.Errorf("acked write %s (seq %d) rolled back to %s on %s", value, seq, v, id))
+				}
 			}
 		}
+		if len(errs) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errs
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	return errs
 }
 
-// linearizabilityOracle delegates to the single-key checker: each node's
-// state machine only moves forward, so reads served by a single node must
-// never roll back. Cross-node rollback is expected and allowed — followers
+// linearizabilityOracle delegates to the single-key checker over the full
+// write+read history: each node's state machine only moves forward, so a
+// reader served by one node must never roll back or observe a write before it
+// was issued. Cross-node staleness is expected and allowed — followers
 // legitimately serve stale data until this store adds linearizable (leader +
-// read-index) reads. Write linearizability is covered by the durability
-// oracle plus the consensus invariants.
+// read-index) reads. Write linearizability is covered by the durability oracle
+// plus the consensus invariants.
 type linearizabilityOracle struct{}
 
 func (linearizabilityOracle) Name() string { return "linearizability" }
@@ -164,10 +177,15 @@ func (linearizabilityOracle) Name() string { return "linearizability" }
 func (linearizabilityOracle) Check(c *Cluster) []error {
 	var ops []linearizability.Op
 	for _, o := range c.hist.snapshot() {
-		if o.kind != "read" || o.readOn == "" {
-			continue
+		switch o.kind {
+		case "write":
+			ops = append(ops, linearizability.Op{Kind: linearizability.Write, Seq: o.seq, Start: o.start.UnixNano(), End: o.end.UnixNano()})
+		case "read":
+			if o.readOn == "" {
+				continue
+			}
+			ops = append(ops, linearizability.Op{Kind: linearizability.Read, Seq: o.seq, Reader: o.readOn, Start: o.start.UnixNano(), End: o.end.UnixNano()})
 		}
-		ops = append(ops, linearizability.Op{Kind: linearizability.Read, Seq: o.seq, Reader: o.readOn, End: o.end.UnixNano()})
 	}
 	return linearizability.Check(ops)
 }

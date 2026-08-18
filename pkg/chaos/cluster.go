@@ -269,20 +269,22 @@ func (h *history) snapshot() []op {
 	return append([]op(nil), h.ops...)
 }
 
-// waitMajorityValue reports whether a majority of started nodes have applied
-// key=value, which is what makes a write durable.
+// waitMajorityValue reports whether key=value has been applied on a quorum of
+// the FULL cluster membership, which is what makes a write committed and thus
+// durable. A majority of the currently started nodes is not enough: during a
+// crash window that majority can be a minority of the cluster, and an entry
+// applied only there may never commit and could be lost.
 func (c *Cluster) waitMajorityValue(key, value string, timeout time.Duration) bool {
+	quorum := len(c.ids)/2 + 1
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		count, total := 0, 0
+		count := 0
 		for _, n := range c.startedNodes() {
-			total++
-			v, err := n.Get(key)
-			if err == nil && v == value {
+			if v, err := n.Get(key); err == nil && v == value {
 				count++
 			}
 		}
-		if total > 0 && count*2 > total {
+		if count >= quorum {
 			return true
 		}
 		time.Sleep(10 * time.Millisecond)

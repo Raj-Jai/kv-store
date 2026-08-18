@@ -99,3 +99,18 @@ func TestFaultClockSkew(t *testing.T) {
 func TestFaultFsError(t *testing.T) {
 	runScenario(t, Fault{Kind: FaultFsError, Target: "", At: baseline, For: active})
 }
+
+// TestFaultMultiFaultSchedule overlaps several fault kinds in one run with the
+// fixed seed, exercising the shared seeded RNG across faults and the oracle
+// set over a combined failure window (Developer B).
+func TestFaultMultiFaultSchedule(t *testing.T) {
+	c := NewCluster(t, 5, seed)
+	c.StartAll(startUp)
+	c.Run([]Fault{
+		{Kind: FaultPacketLoss, Rate: 0.2, At: baseline, For: active},
+		{Kind: FaultCrash, Target: "n1", At: baseline + 300*time.Millisecond, For: active - 300*time.Millisecond},
+		{Kind: FaultLeaderIsolation, At: baseline + 600*time.Millisecond, For: active - 600*time.Millisecond},
+		{Kind: FaultDelay, Delay: 300 * time.Millisecond, At: baseline + 900*time.Millisecond, For: active - 900*time.Millisecond},
+	}, baseline+active, 2*settle, every)
+	c.AssertInvariants()
+}
