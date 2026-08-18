@@ -76,7 +76,7 @@ func assertStoresEqual(t *testing.T, s *DiskStore, oracle *MemStore) {
 	t.Helper()
 
 	s.mem.mu.RLock()
-	got := make(map[string]string, len(s.mem.data))
+	got := make(map[string]entry, len(s.mem.data))
 	for k, v := range s.mem.data {
 		got[k] = v
 	}
