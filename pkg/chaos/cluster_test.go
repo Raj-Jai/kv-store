@@ -114,3 +114,27 @@ func TestFaultMultiFaultSchedule(t *testing.T) {
 	}, baseline+active, 2*settle, every)
 	c.AssertInvariants()
 }
+
+// TestFaultAlternateSeed proves the gate does not depend on seed 42: a
+// representative slice of the fault matrix is run under a second seed with the
+// same schedule timings. CI can point the nightly randomized-seed run at any
+// seed (Developer B).
+func TestFaultAlternateSeed(t *testing.T) {
+	altSeed := uint64(7)
+	scenarios := []struct {
+		name string
+		f    Fault
+	}{
+		{"crash-leader", Fault{Kind: FaultCrash, Target: "n0", At: baseline, For: active}},
+		{"majority-partition", Fault{Kind: FaultMajorityPartition, At: baseline, For: active}},
+		{"fsync-error", Fault{Kind: FaultFsError, Target: "", At: baseline, For: active}},
+	}
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			c := NewCluster(t, 5, altSeed)
+			c.StartAll(startUp)
+			c.Run([]Fault{sc.f}, baseline+active, settle, every)
+			c.AssertInvariants()
+		})
+	}
+}
