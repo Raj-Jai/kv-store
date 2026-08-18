@@ -19,6 +19,13 @@ const (
 	opClear
 )
 
+// maxRecordField bounds a single key/value payload in a WAL record. The HTTP
+// layer rejects request bodies above this size, so a length header claiming
+// more is corruption, not a legitimate write. Bounding the declared length
+// keeps replay from allocating memory proportional to an attacker-controlled
+// header before it discovers the record is truncated.
+const maxRecordField = 1 << 20
+
 // WAL is an append-only log of mutations in the format
 // [opCode][keyLen][key][valLen][value]. An operation is durable once Sync
 // returns; Replay restores the logged state into memory.
@@ -88,7 +95,13 @@ func (w *WAL) Replay(m *MemStore) error {
 	defer f.Close()
 
 	r := bufio.NewReader(f)
-	for {
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat wal for replay: %w", err)
+	}
+	remaining := st.Size()
+
+	for remaining > 0 {
 		op, err := r.ReadByte()
 		if err == io.EOF {
 			return nil
@@ -96,23 +109,27 @@ func (w *WAL) Replay(m *MemStore) error {
 		if err != nil {
 			return fmt.Errorf("read wal: %w", err)
 		}
+		remaining--
 
 		switch opCode(op) {
 		case opPut:
-			key, err := readString(r)
+			key, n, err := readString(r, remaining)
 			if err != nil {
 				return fmt.Errorf("read wal put key: %w", err)
 			}
-			value, err := readString(r)
+			remaining -= n
+			value, n, err := readString(r, remaining)
 			if err != nil {
 				return fmt.Errorf("read wal put value: %w", err)
 			}
+			remaining -= n
 			m.Put(key, value)
 		case opDelete:
-			key, err := readString(r)
+			key, n, err := readString(r, remaining)
 			if err != nil {
 				return fmt.Errorf("read wal delete key: %w", err)
 			}
+			remaining -= n
 			m.Delete(key)
 		case opClear:
 			m.Clear()
@@ -120,18 +137,30 @@ func (w *WAL) Replay(m *MemStore) error {
 			return fmt.Errorf("corrupted wal: unknown op code %d", op)
 		}
 	}
+	return nil
 }
 
-func readString(r *bufio.Reader) (string, error) {
+// readString reads a BigEndian length-prefixed string. remaining is the number
+// of bytes still present in the file; a declared length beyond it (or beyond
+// maxRecordField) is rejected before any allocation, so a corrupt header can
+// never trigger a large allocation. It returns the number of bytes consumed.
+func readString(r *bufio.Reader, remaining int64) (string, int64, error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	buf := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+	length := binary.BigEndian.Uint32(lenBuf[:])
+	if length > maxRecordField {
+		return "", 4, fmt.Errorf("wal record field exceeds %d bytes", maxRecordField)
+	}
+	if int64(length) > remaining-4 {
+		return "", 4, io.ErrUnexpectedEOF
+	}
+	buf := make([]byte, length)
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return "", err
+		return "", 4 + int64(length), err
 	}
-	return string(buf), nil
+	return string(buf), 4 + int64(length), nil
 }
 
 // DiskStore is a durable Engine: mutations are queued, appended to the WAL,

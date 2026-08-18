@@ -4,6 +4,7 @@
 # Runtime data
 data/
 cmd/server/server
+cmd/server/raft.json
 request_test/*
 mydata
 kv-store
