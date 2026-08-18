@@ -88,11 +88,16 @@ func (s *DiskStore) RestoreSnapshot(data []byte) error {
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
 
+	// Replace, not merge: unmarshal into a fresh map so keys absent from the
+	// snapshot (e.g. deleted before the leader took it) do not survive in the
+	// follower's state machine.
+	fresh := make(map[string]string)
 	s.mem.mu.Lock()
-	if err := json.Unmarshal(data, &s.mem.data); err != nil {
+	if err := json.Unmarshal(data, &fresh); err != nil {
 		s.mem.mu.Unlock()
 		return fmt.Errorf("unmarshal snapshot: %w", err)
 	}
+	s.mem.data = fresh
 	s.mem.mu.Unlock()
 
 	if err := s.saveSnapshot(); err != nil {

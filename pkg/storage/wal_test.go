@@ -2,6 +2,8 @@ package storage
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -84,5 +86,49 @@ func TestDiskStoreCrashRecovery(t *testing.T) {
 	v, err := s2.Get("a")
 	if err != nil || v != "1" {
 		t.Fatalf("Get(a) = %q, %v; want 1", v, err)
+	}
+}
+
+// TestReplayRejectsCorruptWAL verifies a WAL with an unknown opcode fails
+// recovery cleanly instead of applying garbage.
+func TestReplayRejectsCorruptWAL(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte{0x7F}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDiskStore(dir); err == nil {
+		t.Fatal("expected error replaying a WAL with an unknown opcode")
+	}
+}
+
+// TestReplayRejectsTruncatedRecord verifies a WAL whose final record is cut
+// short fails recovery cleanly.
+func TestReplayRejectsTruncatedRecord(t *testing.T) {
+	dir := t.TempDir()
+	// opPut with a declared key length of 16 but zero bytes present.
+	if err := os.WriteFile(filepath.Join(dir, "wal.log"), []byte{0x01, 0x00, 0x00, 0x00, 0x10}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDiskStore(dir); err == nil {
+		t.Fatal("expected error replaying a truncated WAL record")
+	}
+}
+
+// TestOpenWALInvalidPath verifies OpenWAL surfaces a create failure.
+func TestOpenWALInvalidPath(t *testing.T) {
+	if _, err := OpenWAL(filepath.Join(t.TempDir(), "missing", "wal.log")); err == nil {
+		t.Fatal("expected error opening a WAL in a missing directory")
+	}
+}
+
+// TestOpenDiskStoreRejectsCorruptSnapshot verifies a corrupt snapshot.dat
+// fails recovery cleanly.
+func TestOpenDiskStoreRejectsCorruptSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.dat"), []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDiskStore(dir); err == nil {
+		t.Fatal("expected error loading a corrupt snapshot")
 	}
 }
